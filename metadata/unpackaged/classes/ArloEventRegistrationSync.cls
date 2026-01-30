@@ -15,14 +15,34 @@
  */
 public with sharing class ArloEventRegistrationSync {
     
-    // Arlo API Configuration
-    public static final String ARLO_API_BASE_URL = 'https://lifeeducationtrust.arlo.co/api/2012-02-01/auth';
+    // Arlo API Configuration - reference ArloApiClient for single source of truth
+    public static final String ARLO_API_BASE_URL = ArloApiClient.BASE_URL;
     
     // Store credentials for Basic Auth (for backward compatibility)
+    @TestVisible
     private static String arloUsername = null;
+    @TestVisible
     private static String arloPassword = null;
-    
-    
+
+    /**
+     * Build and send an authenticated HTTP request to the Arlo API
+     * @param endpoint The full URL endpoint to call
+     * @param username The Arlo username for Basic Auth
+     * @param password The Arlo password for Basic Auth
+     * @return HttpResponse from the API call
+     */
+    @TestVisible
+    private static HttpResponse makeArloRequest(String endpoint, String username, String password) {
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint(endpoint);
+        req.setMethod('GET');
+        req.setHeader('Accept', 'application/xml');
+        Blob authBlob = Blob.valueOf(username + ':' + password);
+        req.setHeader('Authorization', 'Basic ' + EncodingUtil.base64Encode(authBlob));
+        req.setTimeout(30000);
+        return new Http().send(req);
+    }
+
     /**
      * Sync all contacts from events and registrations
      * CONTACT-FIRST APPROACH:
@@ -61,7 +81,7 @@ public with sharing class ArloEventRegistrationSync {
             System.debug('ArloEventRegistrationSync: Found ' + allContactLinks.size() + ' contact links');
             
             if (allContactLinks.isEmpty()) {
-                System.debug('ArloEventRegistrationSync: ❌ NO CONTACT LINKS FOUND');
+                System.debug('ArloEventRegistrationSync: NO CONTACT LINKS FOUND');
                 createLogRecord('Event Registration Sync', 'Warning', null, null, 
                     'No contacts found in Arlo', ARLO_API_BASE_URL + '/resources/contacts/', null, 0, 0);
                 return;
@@ -72,14 +92,11 @@ public with sharing class ArloEventRegistrationSync {
                 'Found ' + allContactLinks.size() + ' contacts. Starting batch processing...', 
                 ARLO_API_BASE_URL + '/resources/contacts/', null, allContactLinks.size(), null);
             
-            // STEP 3: Enqueue Queueable job to process contacts in batches
-            System.debug('ArloEventRegistrationSync: Enqueueing Queueable job to process ' + allContactLinks.size() + ' contacts in batches');
-            ArloContactRegistrationSyncQueueable queueable = new ArloContactRegistrationSyncQueueable(
-                allContactLinks, username, password, logId, 0
-            );
-            Id jobId = System.enqueueJob(queueable);
-            System.debug('ArloEventRegistrationSync: Queueable job enqueued. Job ID: ' + jobId);
-            System.debug('ArloEventRegistrationSync: Processing will continue asynchronously in batches');
+            // STEP 3: Use batch class for processing
+            System.debug('ArloEventRegistrationSync: Starting batch job to process ' + allContactLinks.size() + ' contacts');
+            ArloRegistrationSyncBatch batch = new ArloRegistrationSyncBatch(username, password);
+            Id jobId = Database.executeBatch(batch, 5);
+            System.debug('ArloEventRegistrationSync: Batch job started. Job ID: ' + jobId);
             
         } catch (Exception e) {
             System.debug('ArloEventRegistrationSync: Error starting sync: ' + e.getMessage());
@@ -87,7 +104,355 @@ public with sharing class ArloEventRegistrationSync {
             throw new ArloSyncException('Sync failed: ' + e.getMessage(), e);
         }
     }
-    
+
+    // ==================== HELPER METHODS FOR processContactsBatch ====================
+
+    /**
+     * Parse deferred contact entries from previous batch
+     * @param deferredContactIds List of strings in format "contactId:regId1,regId2"
+     * @return Map of contactId to Set of registrationIds that need processing
+     */
+    @TestVisible
+    private static Map<String, Set<String>> parseDeferredContactEntries(List<String> deferredContactIds) {
+        Map<String, Set<String>> contactsWithUnprocessedRegistrations = new Map<String, Set<String>>();
+
+        if (deferredContactIds == null || deferredContactIds.isEmpty()) {
+            return contactsWithUnprocessedRegistrations;
+        }
+
+        for (String deferredEntry : deferredContactIds) {
+            if (String.isNotBlank(deferredEntry) && deferredEntry.contains(':')) {
+                String[] parts = deferredEntry.split(':', 2);
+                if (parts.size() == 2) {
+                    String contactId = parts[0].trim();
+                    String[] regIds = parts[1].split(',');
+                    Set<String> regIdSet = new Set<String>();
+                    for (String regId : regIds) {
+                        if (String.isNotBlank(regId)) {
+                            regIdSet.add(regId.trim());
+                        }
+                    }
+                    if (!regIdSet.isEmpty()) {
+                        contactsWithUnprocessedRegistrations.put(contactId, regIdSet);
+                        System.debug('ArloEventRegistrationSync: Loaded deferred contact ' + contactId + ' with ' + regIdSet.size() + ' unprocessed registration(s): ' + regIdSet);
+                    }
+                }
+            }
+        }
+
+        return contactsWithUnprocessedRegistrations;
+    }
+
+    /**
+     * Process a single registration and determine if it should be synced
+     * @param registrationId The Arlo registration ID
+     * @param username Arlo API username
+     * @param password Arlo API password
+     * @param calloutCount Current callout count (will be incremented)
+     * @return RegistrationProcessingResult with eventData if successful, null if should skip
+     */
+    @TestVisible
+    private static RegistrationProcessingResult processRegistration(String registrationId, String username, String password, Integer calloutCount) {
+        RegistrationProcessingResult result = new RegistrationProcessingResult(calloutCount);
+
+        // Get event ID from registration
+        result.calloutCount++;
+        String eventId = getEventIdFromRegistrationStatic(registrationId, username, password);
+        if (String.isBlank(eventId)) {
+            return result;
+        }
+
+        // Get event details
+        result.calloutCount++;
+        EventData eventData = getEventDetailsStatic(eventId, username, password);
+        if (eventData == null) {
+            return result;
+        }
+
+        // Check if event contains NHM
+        if (!isNhmEvent(eventData)) {
+            return result;
+        }
+
+        // Check email consent
+        result.calloutCount++;
+        Boolean hasEmailConsent = checkRegistrationEmailConsentStatic(registrationId, username, password);
+        if (!hasEmailConsent) {
+            return result;
+        }
+
+        // All checks passed
+        result.eventData = eventData;
+        result.shouldProcess = true;
+        return result;
+    }
+
+    /**
+     * Check if an event is an NHM event (contains "NHM" in name or code)
+     * @param eventData The event data to check
+     * @return true if the event contains NHM
+     */
+    @TestVisible
+    private static Boolean isNhmEvent(EventData eventData) {
+        if (eventData == null) {
+            return false;
+        }
+        if (String.isNotBlank(eventData.name) && eventData.name.contains('NHM')) {
+            return true;
+        }
+        if (String.isNotBlank(eventData.code) && eventData.code.contains('NHM')) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Find registrations that weren't processed (for tracking unprocessed work)
+     * @param allRegistrations All registration IDs for a contact
+     * @param processedRegistrations Registration IDs that were processed
+     * @return Set of registration IDs that still need processing
+     */
+    @TestVisible
+    private static Set<String> findUnprocessedRegistrations(Set<String> allRegistrations, Set<String> processedRegistrations) {
+        Set<String> unprocessed = new Set<String>();
+        for (String regId : allRegistrations) {
+            if (!processedRegistrations.contains(regId)) {
+                unprocessed.add(regId);
+            }
+        }
+        return unprocessed;
+    }
+
+    /**
+     * Build reverse lookup maps from arloContactMap (numericId -> ArloContact)
+     * to find numeric IDs from UUID or email
+     * @param arloContactMap Map of numericId to ArloContact
+     * @return ReverseMapsResult with uuidToNumericId and emailToNumericId maps
+     */
+    @TestVisible
+    private static ReverseMapsResult buildReverseMaps(Map<String, ArloModels.ArloContact> arloContactMap) {
+        ReverseMapsResult result = new ReverseMapsResult();
+
+        for (String numericId : arloContactMap.keySet()) {
+            ArloModels.ArloContact ac = arloContactMap.get(numericId);
+            if (ac != null) {
+                if (String.isNotBlank(ac.contactId)) {
+                    result.uuidToNumericId.put(ac.contactId.trim().toLowerCase(), numericId);
+                }
+                if (String.isNotBlank(ac.email)) {
+                    result.emailToNumericId.put(ac.email.toLowerCase().trim(), numericId);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Find ContactEventWrappers that don't have matching Salesforce contacts
+     * Public static for reuse by ArloRegistrationSyncBatch
+     * @param contactEventList List of all contact-event wrappers
+     * @param syncedContactMap Map of Salesforce contacts that were found
+     * @return List of wrappers that need to have contacts created
+     */
+    public static List<ContactEventWrapper> findUnmatchedWrappers(
+        List<ContactEventWrapper> contactEventList,
+        Map<Id, Contact> syncedContactMap
+    ) {
+        List<ContactEventWrapper> unmatchedWrappers = new List<ContactEventWrapper>();
+        Set<String> matchedUuids = new Set<String>();
+        Set<String> matchedEmails = new Set<String>();
+
+        for (Contact c : syncedContactMap.values()) {
+            if (String.isNotBlank(c.Arlo_Contact_UUID__c)) {
+                matchedUuids.add(c.Arlo_Contact_UUID__c.trim().toLowerCase());
+            }
+            if (String.isNotBlank(c.Email)) {
+                matchedEmails.add(c.Email.toLowerCase().trim());
+            }
+        }
+
+        for (ContactEventWrapper wrapper : contactEventList) {
+            if (wrapper.contact != null) {
+                String wrapperUuid = wrapper.contact.contactId != null ? wrapper.contact.contactId.trim().toLowerCase() : '';
+                String wrapperEmail = wrapper.contact.email != null ? wrapper.contact.email.toLowerCase().trim() : '';
+
+                Boolean isMatched = (String.isNotBlank(wrapperUuid) && matchedUuids.contains(wrapperUuid)) ||
+                                   (String.isNotBlank(wrapperEmail) && matchedEmails.contains(wrapperEmail));
+
+                if (!isMatched) {
+                    unmatchedWrappers.add(wrapper);
+                }
+            }
+        }
+
+        return unmatchedWrappers;
+    }
+
+    /**
+     * Create contacts in Salesforce for unmatched wrappers
+     * @param unmatchedWrappers List of ContactEventWrappers without matching SF contacts
+     * @param arloContactMap Map of numericId to ArloContact
+     * @param syncedContactMap Map to add newly created contacts to
+     * @param username Arlo API username
+     * @param password Arlo API password
+     * @param calloutCount Current callout count
+     * @param maxCallouts Maximum allowed callouts
+     * @return Updated callout count after contact creation
+     */
+    @TestVisible
+    private static Integer createContactsInSalesforce(
+        List<ContactEventWrapper> unmatchedWrappers,
+        Map<String, ArloModels.ArloContact> arloContactMap,
+        Map<Id, Contact> syncedContactMap,
+        String username,
+        String password,
+        Integer calloutCount,
+        Integer maxCallouts
+    ) {
+        if (unmatchedWrappers.isEmpty()) {
+            return calloutCount;
+        }
+
+        System.debug('ArloEventRegistrationSync: Found ' + unmatchedWrappers.size() + ' unmatched contact(s) - will create in Salesforce');
+
+        // Build reverse maps to find numeric IDs from UUID/Email
+        ReverseMapsResult reverseMaps = buildReverseMaps(arloContactMap);
+
+        // Map unmatched wrappers to their numeric IDs
+        Map<String, ContactEventWrapper> numericIdToWrapper = new Map<String, ContactEventWrapper>();
+        for (ContactEventWrapper wrapper : unmatchedWrappers) {
+            String numericId = null;
+            if (wrapper.contact != null) {
+                String wrapperUuid = wrapper.contact.contactId != null ? wrapper.contact.contactId.trim().toLowerCase() : '';
+                String wrapperEmail = wrapper.contact.email != null ? wrapper.contact.email.toLowerCase().trim() : '';
+
+                if (String.isNotBlank(wrapperUuid) && reverseMaps.uuidToNumericId.containsKey(wrapperUuid)) {
+                    numericId = reverseMaps.uuidToNumericId.get(wrapperUuid);
+                } else if (String.isNotBlank(wrapperEmail) && reverseMaps.emailToNumericId.containsKey(wrapperEmail)) {
+                    numericId = reverseMaps.emailToNumericId.get(wrapperEmail);
+                }
+
+                if (String.isNotBlank(numericId) && !numericIdToWrapper.containsKey(numericId)) {
+                    numericIdToWrapper.put(numericId, wrapper);
+                }
+            }
+        }
+
+        // Calculate how many contacts we can create with available callouts
+        Integer availableCallouts = maxCallouts - calloutCount;
+        System.debug('ArloEventRegistrationSync: ===== CONTACT CREATION PHASE =====');
+        System.debug('ArloEventRegistrationSync: Available callouts for contact creation: ' + availableCallouts + ' (need ' + (numericIdToWrapper.size() * 3) + ' for all ' + numericIdToWrapper.size() + ' contacts)');
+        System.debug('ArloEventRegistrationSync: Unmatched contacts to create: ' + numericIdToWrapper.size());
+
+        // Each contact needs 3 callouts (contact + employment + org)
+        Integer contactsToCreateCount = 0;
+        if (availableCallouts >= 6) {
+            // Reserve 3 callouts for safety, use the rest for contact creation
+            contactsToCreateCount = (availableCallouts - 3) / 3;
+            if (contactsToCreateCount > numericIdToWrapper.size()) {
+                contactsToCreateCount = numericIdToWrapper.size();
+            }
+        }
+
+        if (contactsToCreateCount == 0) {
+            System.debug('ArloEventRegistrationSync: WARNING: Not enough callout budget to create contacts (available: ' + availableCallouts + ')');
+            System.debug('ArloEventRegistrationSync: ' + numericIdToWrapper.size() + ' contact(s) with valid registrations will NOT be created in this batch');
+            System.debug('ArloEventRegistrationSync: These contacts will be created in the next full sync run');
+            System.debug('ArloEventRegistrationSync: RECOMMENDATION: Run the full sync again to create these contacts');
+            return calloutCount;
+        } else if (contactsToCreateCount < numericIdToWrapper.size()) {
+            System.debug('ArloEventRegistrationSync: Limited callout budget - will create ' + contactsToCreateCount + ' of ' + numericIdToWrapper.size() + ' unmatched contact(s) in this batch');
+            System.debug('ArloEventRegistrationSync: Remaining ' + (numericIdToWrapper.size() - contactsToCreateCount) + ' contact(s) will be created in next batch or next full sync');
+
+            // Limit to contacts we can create now
+            List<String> numericIdsToProcess = new List<String>(numericIdToWrapper.keySet());
+            for (Integer i = contactsToCreateCount; i < numericIdsToProcess.size(); i++) {
+                numericIdToWrapper.remove(numericIdsToProcess[i]);
+            }
+        } else {
+            System.debug('ArloEventRegistrationSync: Sufficient callout budget - will create all ' + numericIdToWrapper.size() + ' unmatched contact(s)');
+        }
+
+        // Fetch full contact details for unmatched contacts
+        List<ArloModels.ArloContact> contactsToCreate = new List<ArloModels.ArloContact>();
+
+        for (String numericContactId : numericIdToWrapper.keySet()) {
+            Integer remainingCallouts = maxCallouts - calloutCount;
+            if (remainingCallouts < 5) {
+                System.debug('ArloEventRegistrationSync: Reached callout limit - stopping contact creation (remaining: ' + remainingCallouts + ')');
+                System.debug('ArloEventRegistrationSync: Will create remaining contacts in next batch');
+                break;
+            }
+
+            System.debug('ArloEventRegistrationSync: Fetching full contact details for ID ' + numericContactId + ' to create in Salesforce (callout count: ' + calloutCount + ', remaining: ' + remainingCallouts + ')');
+            ArloModels.ArloContact fullContact = ArloContactSync.getSingleArloContactStatic(numericContactId, username, password);
+            calloutCount += 3; // getSingleArloContactStatic makes 3 callouts
+
+            if (fullContact != null && String.isNotBlank(fullContact.organisationCodePrimary)) {
+                contactsToCreate.add(fullContact);
+                System.debug('ArloEventRegistrationSync: Contact ' + numericContactId + ' will be created with Account CodePrimary: ' + fullContact.organisationCodePrimary);
+            } else {
+                System.debug('ArloEventRegistrationSync: Cannot create contact ' + numericContactId + ' - no organisation CodePrimary found');
+            }
+        }
+
+        // Create contacts in Salesforce (grouped by Account)
+        if (!contactsToCreate.isEmpty()) {
+            Map<String, List<ArloModels.ArloContact>> contactsByAccount = new Map<String, List<ArloModels.ArloContact>>();
+
+            for (ArloModels.ArloContact ac : contactsToCreate) {
+                if (String.isNotBlank(ac.organisationCodePrimary)) {
+                    if (!contactsByAccount.containsKey(ac.organisationCodePrimary)) {
+                        contactsByAccount.put(ac.organisationCodePrimary, new List<ArloModels.ArloContact>());
+                    }
+                    contactsByAccount.get(ac.organisationCodePrimary).add(ac);
+                }
+            }
+
+            // Create contacts for each Account
+            for (String codePrimary : contactsByAccount.keySet()) {
+                Account sfAccount = getSalesforceAccountByNumberStatic(codePrimary);
+                if (sfAccount != null) {
+                    List<ArloModels.ArloContact> accountContacts = contactsByAccount.get(codePrimary);
+                    System.debug('ArloEventRegistrationSync: Creating ' + accountContacts.size() + ' contact(s) for Account: ' + sfAccount.Name);
+                    ArloContactSync.syncContactsToSalesforceStatic(accountContacts, sfAccount.Id);
+
+                    // Query for newly created contacts
+                    Set<String> newContactUuids = new Set<String>();
+                    Set<String> newContactEmails = new Set<String>();
+                    for (ArloModels.ArloContact ac : accountContacts) {
+                        if (String.isNotBlank(ac.contactId)) {
+                            newContactUuids.add(ac.contactId);
+                        }
+                        if (String.isNotBlank(ac.email)) {
+                            newContactEmails.add(ac.email);
+                        }
+                    }
+
+                    List<Contact> newlyCreatedContacts = [
+                        SELECT Id, FirstName, LastName, Email, Arlo_Contact_UUID__c
+                        FROM Contact
+                        WHERE (Arlo_Contact_UUID__c IN :newContactUuids AND Arlo_Contact_UUID__c != null)
+                           OR (Email IN :newContactEmails AND Email != null)
+                    ];
+
+                    for (Contact c : newlyCreatedContacts) {
+                        syncedContactMap.put(c.Id, c);
+                    }
+
+                    System.debug('ArloEventRegistrationSync: Successfully created ' + newlyCreatedContacts.size() + ' contact(s)');
+                } else {
+                    System.debug('ArloEventRegistrationSync: Cannot create contacts - Account not found for CodePrimary: ' + codePrimary);
+                }
+            }
+        }
+
+        return calloutCount;
+    }
+
+    // ==================== END HELPER METHODS ====================
+
     /**
      * Process contacts in batch (for use by Queueable)
      * CONTACT-FIRST FLOW:
@@ -109,147 +474,82 @@ public with sharing class ArloEventRegistrationSync {
         Integer totalFailed = 0;
         Integer contactsProcessed = 0;
         Integer activeContactsProcessed = 0;
-        
+
         // STEP 2: Process each contact - check Status = Active, get registrations
         List<ContactEventWrapper> contactEventList = new List<ContactEventWrapper>();
-        Map<String, ArloContactSync.ArloContact> arloContactMap = new Map<String, ArloContactSync.ArloContact>(); // Map: numericContactId -> ArloContact
+        Map<String, ArloModels.ArloContact> arloContactMap = new Map<String, ArloModels.ArloContact>();
         Integer calloutCount = 0;
         Integer maxCallouts = 95; // Leave some room for DML operations
-        
-        // Track contacts with unprocessed registrations (due to callout limits)
-        // Format: Map<numericContactId, Set<registrationId>> - tracks which registrations still need processing
-        Map<String, Set<String>> contactsWithUnprocessedRegistrations = new Map<String, Set<String>>();
-        
-        // Parse deferred contacts from previous batch (if any)
-        // Format: "contactId:regId1,regId2|contactId2:regId3,regId4"
-        if (deferredContactIds != null && !deferredContactIds.isEmpty()) {
-            for (String deferredEntry : deferredContactIds) {
-                if (String.isNotBlank(deferredEntry) && deferredEntry.contains(':')) {
-                    String[] parts = deferredEntry.split(':', 2);
-                    if (parts.size() == 2) {
-                        String contactId = parts[0].trim();
-                        String[] regIds = parts[1].split(',');
-                        Set<String> regIdSet = new Set<String>();
-                        for (String regId : regIds) {
-                            if (String.isNotBlank(regId)) {
-                                regIdSet.add(regId.trim());
-                            }
-                        }
-                        if (!regIdSet.isEmpty()) {
-                            contactsWithUnprocessedRegistrations.put(contactId, regIdSet);
-                            System.debug('ArloEventRegistrationSync: Loaded deferred contact ' + contactId + ' with ' + regIdSet.size() + ' unprocessed registration(s): ' + regIdSet);
-                        }
-                    }
-                }
-            }
-        }
-        
+
+        // Parse deferred contacts from previous batch using helper method
+        Map<String, Set<String>> contactsWithUnprocessedRegistrations = parseDeferredContactEntries(deferredContactIds);
+
         try {
             // First, process any deferred contacts (contacts with unprocessed registrations from previous batch)
-            // These need to be processed even if they're not in the current batch range
             Set<String> deferredContactIdsToProcess = contactsWithUnprocessedRegistrations.keySet();
             if (!deferredContactIdsToProcess.isEmpty()) {
                 System.debug('ArloEventRegistrationSync: Processing ' + deferredContactIdsToProcess.size() + ' deferred contact(s) with unprocessed registrations first');
                 for (String deferredContactId : deferredContactIdsToProcess) {
-                    if (calloutCount >= maxCallouts - 10) { // Reserve 10 for safety
+                    if (calloutCount >= maxCallouts - 10) {
                         System.debug('ArloEventRegistrationSync: Reached callout limit while processing deferred contacts - will retry remaining in next batch');
                         break;
                     }
-                    
-                    // Process this deferred contact
+
                     try {
                         // Get contact details (we need UUID/Email for matching)
                         calloutCount++;
-                        ArloContactSync.ArloContact arloContact = getContactUuidAndEmailOnly(deferredContactId, username, password);
+                        ArloModels.ArloContact arloContact = getContactUuidAndEmailOnly(deferredContactId, username, password);
                         if (arloContact == null || (String.isBlank(arloContact.contactId) && String.isBlank(arloContact.email))) {
-                            System.debug('ArloEventRegistrationSync: ⚠️ Could not get contact UUID/Email for deferred contact ID: ' + deferredContactId);
-                            contactsWithUnprocessedRegistrations.remove(deferredContactId); // Remove if we can't process
+                            System.debug('ArloEventRegistrationSync: Could not get contact UUID/Email for deferred contact ID: ' + deferredContactId);
+                            contactsWithUnprocessedRegistrations.remove(deferredContactId);
                             continue;
                         }
                         arloContactMap.put(deferredContactId, arloContact);
-                        
-                        // Get the unprocessed registrations for this contact
+
                         Set<String> unprocessedRegIds = contactsWithUnprocessedRegistrations.get(deferredContactId);
                         System.debug('ArloEventRegistrationSync: Processing deferred contact ' + deferredContactId + ' with ' + unprocessedRegIds.size() + ' unprocessed registration(s)');
-                        
-                        // Process each unprocessed registration
+
+                        // Process each unprocessed registration using helper method
                         Set<String> processedRegIds = new Set<String>();
                         for (String registrationId : unprocessedRegIds) {
                             if (calloutCount >= maxCallouts - 5) {
                                 System.debug('ArloEventRegistrationSync: Reached callout limit while processing deferred registrations - will retry remaining');
                                 break;
                             }
-                            
-                            // Process this registration (same logic as normal flow)
-                            calloutCount++;
-                            String eventId = getEventIdFromRegistrationStatic(registrationId, username, password);
-                            if (String.isBlank(eventId)) {
-                                processedRegIds.add(registrationId); // Mark as processed (failed)
-                                continue;
+
+                            RegistrationProcessingResult regResult = processRegistration(registrationId, username, password, calloutCount);
+                            calloutCount = regResult.calloutCount;
+
+                            if (regResult.shouldProcess && regResult.eventData != null) {
+                                ContactEventWrapper wrapper = new ContactEventWrapper();
+                                wrapper.contact = arloContact;
+                                wrapper.eventName = regResult.eventData.name;
+                                wrapper.eventCode = regResult.eventData.code;
+                                contactEventList.add(wrapper);
+                                totalProcessed++;
+                                System.debug('ArloEventRegistrationSync: Processed deferred registration ' + registrationId + ' for contact ' + deferredContactId);
                             }
-                            
-                            calloutCount++;
-                            EventData eventData = getEventDetailsStatic(eventId, username, password);
-                            if (eventData == null) {
-                                processedRegIds.add(registrationId); // Mark as processed (failed)
-                                continue;
-                            }
-                            
-                            // Check if event contains NHM
-                            Boolean eventContainsNHM = false;
-                            if (String.isNotBlank(eventData.name) && eventData.name.contains('NHM')) {
-                                eventContainsNHM = true;
-                            } else if (String.isNotBlank(eventData.code) && eventData.code.contains('NHM')) {
-                                eventContainsNHM = true;
-                            }
-                            
-                            if (!eventContainsNHM) {
-                                processedRegIds.add(registrationId); // Mark as processed (skipped)
-                                continue;
-                            }
-                            
-                            // Check email consent
-                            calloutCount++;
-                            Boolean hasEmailConsent = checkRegistrationEmailConsentStatic(registrationId, username, password);
-                            if (!hasEmailConsent) {
-                                processedRegIds.add(registrationId); // Mark as processed (skipped)
-                                continue;
-                            }
-                            
-                            // Create wrapper
-                            ContactEventWrapper wrapper = new ContactEventWrapper();
-                            wrapper.contact = arloContact;
-                            wrapper.eventName = eventData.name;
-                            wrapper.eventCode = eventData.code;
-                            contactEventList.add(wrapper);
-                            totalProcessed++;
                             processedRegIds.add(registrationId);
-                            System.debug('ArloEventRegistrationSync: ✓ Processed deferred registration ' + registrationId + ' for contact ' + deferredContactId);
                         }
-                        
-                        // Update unprocessed list - remove processed ones
-                        Set<String> stillUnprocessed = new Set<String>();
-                        for (String regId : unprocessedRegIds) {
-                            if (!processedRegIds.contains(regId)) {
-                                stillUnprocessed.add(regId);
-                            }
-                        }
-                        
+
+                        // Update unprocessed list using helper method
+                        Set<String> stillUnprocessed = findUnprocessedRegistrations(unprocessedRegIds, processedRegIds);
+
                         if (stillUnprocessed.isEmpty()) {
                             contactsWithUnprocessedRegistrations.remove(deferredContactId);
-                            System.debug('ArloEventRegistrationSync: ✓ Completed all deferred registrations for contact ' + deferredContactId);
+                            System.debug('ArloEventRegistrationSync: Completed all deferred registrations for contact ' + deferredContactId);
                         } else {
                             contactsWithUnprocessedRegistrations.put(deferredContactId, stillUnprocessed);
-                            System.debug('ArloEventRegistrationSync: ⚠️ Contact ' + deferredContactId + ' still has ' + stillUnprocessed.size() + ' unprocessed registration(s) - will retry: ' + stillUnprocessed);
+                            System.debug('ArloEventRegistrationSync: Contact ' + deferredContactId + ' still has ' + stillUnprocessed.size() + ' unprocessed registration(s) - will retry');
                         }
-                        
+
                     } catch (Exception e) {
                         System.debug('ArloEventRegistrationSync: Error processing deferred contact ' + deferredContactId + ': ' + e.getMessage());
-                        // Keep it in the deferred list for retry
+                        System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
                     }
                 }
             }
-            
+
             // Process contacts in batch starting from startIndex
             Integer endIndex = startIndex;
             for (Integer i = startIndex; i < contactLinks.size() && calloutCount < maxCallouts; i++) {
@@ -264,221 +564,98 @@ public with sharing class ArloEventRegistrationSync {
                     // Extract numeric contact ID from link (e.g., /contacts/300/ -> 300)
                     String numericContactId = extractContactIdFromLink(contactLink);
                     if (String.isBlank(numericContactId)) {
-                        System.debug('ArloEventRegistrationSync: ⚠️ Could not extract contact ID from link: ' + contactLink);
+                        System.debug('ArloEventRegistrationSync: Could not extract contact ID from link: ' + contactLink);
                         continue;
                     }
-                    
+
                     // Skip if this contact was already processed as a deferred contact
                     if (contactsWithUnprocessedRegistrations.containsKey(numericContactId)) {
-                        System.debug('ArloEventRegistrationSync: Contact ' + numericContactId + ' is in deferred list - skipping normal processing (will be handled by deferred logic)');
+                        System.debug('ArloEventRegistrationSync: Contact ' + numericContactId + ' is in deferred list - skipping');
                         continue;
                     }
-                    
+
                     contactsProcessed++;
-                    
-                    // Debug: Check if this is contact 1944
-                    if (numericContactId == '1944') {
-                        System.debug('ArloEventRegistrationSync: *** FOUND CONTACT 1944 IN ARLO ***');
-                    }
-                    
-                    // STEP 2a: Get contact details and check Status = "Active"
+
+                    // Get contact details and check Status = "Active"
                     calloutCount++;
-                    System.debug('ArloEventRegistrationSync: Callout ' + calloutCount + ' - Getting contact details for ID: ' + numericContactId);
                     String contactStatus = getContactStatusStatic(numericContactId, username, password);
-                    
+
                     if (String.isBlank(contactStatus) || contactStatus != 'Active') {
-                        if (numericContactId == '1944') {
-                            System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Status is "' + contactStatus + '" (not Active) - SKIPPING ***');
-                        }
-                        continue; // Skip non-Active contacts
+                        continue;
                     }
-                    
+
                     activeContactsProcessed++;
-                    
-                    // Debug: Check if this is contact 1944
-                    if (numericContactId == '1944') {
-                        System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Status is Active - PROCESSING ***');
-                    }
-                    
-                    // STEP 2b: Get contact details (UUID, Email) for Salesforce matching (skip employment/org to save callouts)
+
+                    // Get contact details (UUID, Email) for Salesforce matching
                     calloutCount++;
-                    ArloContactSync.ArloContact arloContact = getContactUuidAndEmailOnly(numericContactId, username, password);
+                    ArloModels.ArloContact arloContact = getContactUuidAndEmailOnly(numericContactId, username, password);
                     if (arloContact == null || (String.isBlank(arloContact.contactId) && String.isBlank(arloContact.email))) {
-                        System.debug('ArloEventRegistrationSync: ⚠️ Could not get contact UUID/Email for ID: ' + numericContactId);
+                        System.debug('ArloEventRegistrationSync: Could not get contact UUID/Email for ID: ' + numericContactId);
                         continue;
                     }
                     arloContactMap.put(numericContactId, arloContact);
-                    
-                    // STEP 2c: Get registrations for this contact
+
+                    // Get registrations for this contact
                     calloutCount++;
-                    System.debug('ArloEventRegistrationSync: Callout ' + calloutCount + ' - Getting registrations for contact ' + numericContactId);
                     Set<String> registrationIds = getContactRegistrationsStatic(numericContactId, username, password);
-                    
+
                     if (registrationIds.isEmpty()) {
-                        if (numericContactId == '1944') {
-                            System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - No registrations found ***');
-                        }
                         continue;
                     }
-                    
-                    // Debug: Check if this is contact 1944
-                    if (numericContactId == '1944') {
-                        System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Found ' + registrationIds.size() + ' registration(s) ***');
-                    }
-                    
-                    // Check if this contact has unprocessed registrations from a previous batch
+
+                    // Determine which registrations to process
                     Set<String> registrationsToProcess = new Set<String>(registrationIds);
                     if (contactsWithUnprocessedRegistrations.containsKey(numericContactId)) {
                         Set<String> unprocessed = contactsWithUnprocessedRegistrations.get(numericContactId);
-                        // Only process the unprocessed registrations that still exist in the current registration list
                         registrationsToProcess.clear();
                         for (String regId : unprocessed) {
                             if (registrationIds.contains(regId)) {
                                 registrationsToProcess.add(regId);
                             }
                         }
-                        System.debug('ArloEventRegistrationSync: Contact ' + numericContactId + ' has ' + unprocessed.size() + ' unprocessed registration(s) from previous batch - will process ' + registrationsToProcess.size() + ' of them');
-                        contactsWithUnprocessedRegistrations.remove(numericContactId); // Remove from tracking
-                        
+                        System.debug('ArloEventRegistrationSync: Contact ' + numericContactId + ' has ' + unprocessed.size() + ' unprocessed registration(s) from previous batch');
+                        contactsWithUnprocessedRegistrations.remove(numericContactId);
+
                         if (registrationsToProcess.isEmpty()) {
-                            System.debug('ArloEventRegistrationSync: Contact ' + numericContactId + ' - all deferred registrations were already processed or no longer exist - skipping');
-                            continue; // Skip this contact if no registrations to process
+                            continue;
                         }
                     }
-                    
-                    // STEP 3: Process each registration and check consent individually
-                    // Only process registrations that have consent=true
-                    // IMPORTANT: Reserve callouts for contact creation - contacts with valid registrations MUST be created
-                    // Estimate: Each unmatched contact needs 3 callouts (contact + employment + org)
-                    // Reserve enough for at least 3-5 contacts to be created
-                    Integer reservedCalloutsForContactCreation = 15; // Reserve for 5 contacts × 3 callouts each
-                    Integer effectiveMaxCallouts = maxCallouts - reservedCalloutsForContactCreation;
-                    
-                    // Special handling for contact 1944 - ensure all registrations are processed
-                    Boolean isContact1944 = (numericContactId == '1944');
-                    Boolean isContact946 = (numericContactId == '946');
-                    if (isContact1944 || isContact946) {
-                        System.debug('ArloEventRegistrationSync: *** CONTACT ' + numericContactId + ' - Processing ' + registrationsToProcess.size() + ' registration(s) - will use up to ' + (maxCallouts - calloutCount) + ' remaining callouts ***');
-                    }
-                    
+
+                    // Process each registration using helper method
                     Set<String> processedRegistrationIds = new Set<String>();
                     for (String registrationId : registrationsToProcess) {
-                        // Check callout limit
                         Integer remainingCallouts = maxCallouts - calloutCount;
                         if (remainingCallouts < 5) {
-                            if (isContact1944 || isContact946) {
-                                System.debug('ArloEventRegistrationSync: *** CONTACT ' + numericContactId + ' - WARNING: Only ' + remainingCallouts + ' callouts remaining - will defer remaining registrations to next batch ***');
-                            }
-                            System.debug('ArloEventRegistrationSync: Approaching callout limit (remaining: ' + remainingCallouts + ', reserved: ' + reservedCalloutsForContactCreation + ' for contact creation) - stopping registration processing');
-                            
-                            // Track unprocessed registrations for this contact
-                            Set<String> unprocessed = new Set<String>();
-                            for (String regId : registrationsToProcess) {
-                                if (!processedRegistrationIds.contains(regId)) {
-                                    unprocessed.add(regId);
-                                }
-                            }
+                            System.debug('ArloEventRegistrationSync: Approaching callout limit (remaining: ' + remainingCallouts + ') - stopping registration processing');
+                            Set<String> unprocessed = findUnprocessedRegistrations(registrationsToProcess, processedRegistrationIds);
                             if (!unprocessed.isEmpty()) {
                                 contactsWithUnprocessedRegistrations.put(numericContactId, unprocessed);
-                                System.debug('ArloEventRegistrationSync: ⚠️ Contact ' + numericContactId + ' has ' + unprocessed.size() + ' unprocessed registration(s) - will retry in next batch: ' + unprocessed);
+                                System.debug('ArloEventRegistrationSync: Contact ' + numericContactId + ' has ' + unprocessed.size() + ' unprocessed registration(s) - will retry in next batch');
                             }
                             break;
                         }
-                        
-                        // STEP 3a: Get registration details (to get event ID)
-                        calloutCount++;
-                        System.debug('ArloEventRegistrationSync: Callout ' + calloutCount + ' - Getting registration details: ' + registrationId);
-                        String eventId = getEventIdFromRegistrationStatic(registrationId, username, password);
-                        if (String.isBlank(eventId)) {
-                            continue;
+
+                        RegistrationProcessingResult regResult = processRegistration(registrationId, username, password, calloutCount);
+                        calloutCount = regResult.calloutCount;
+
+                        if (regResult.shouldProcess && regResult.eventData != null) {
+                            ContactEventWrapper wrapper = new ContactEventWrapper();
+                            wrapper.contact = arloContact;
+                            wrapper.eventName = regResult.eventData.name;
+                            wrapper.eventCode = regResult.eventData.code;
+                            contactEventList.add(wrapper);
+                            totalProcessed++;
                         }
-                        
-                        // STEP 3b: Get event details and check if event contains "NHM" (not CONF)
-                        calloutCount++;
-                        System.debug('ArloEventRegistrationSync: Callout ' + calloutCount + ' - Getting event details: ' + eventId);
-                        EventData eventData = getEventDetailsStatic(eventId, username, password);
-                        if (eventData == null) {
-                            continue;
-                        }
-                        
-                        // Only process events that contain "NHM" (this excludes CONF events)
-                        Boolean eventContainsNHM = false;
-                        if (String.isNotBlank(eventData.name) && eventData.name.contains('NHM')) {
-                            eventContainsNHM = true;
-                        } else if (String.isNotBlank(eventData.code) && eventData.code.contains('NHM')) {
-                            eventContainsNHM = true;
-                        }
-                        
-                        if (!eventContainsNHM) {
-                            if (numericContactId == '1944') {
-                                System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Registration ' + registrationId + ' is for non-NHM event (Name: "' + eventData.name + '", Code: "' + eventData.code + '") - SKIPPING ***');
-                            }
-                            continue;
-                        }
-                        
-                        System.debug('ArloEventRegistrationSync: Event contains NHM - Name: "' + eventData.name + '", Code: "' + eventData.code + '"');
-                        
-                        // STEP 3c: Check email consent for THIS SPECIFIC registration
-                        calloutCount++;
-                        System.debug('ArloEventRegistrationSync: Callout ' + calloutCount + ' - Checking email consent for registration: ' + registrationId);
-                        Boolean hasEmailConsent = checkRegistrationEmailConsentStatic(registrationId, username, password);
-                        if (!hasEmailConsent) {
-                            if (isContact1944) {
-                                System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Registration ' + registrationId + ' has NO email consent - SKIPPING THIS REGISTRATION ***');
-                            } else {
-                                System.debug('ArloEventRegistrationSync: Registration ' + registrationId + ' has NO email consent - SKIPPING');
-                            }
-                            continue; // Skip this registration, but continue checking other registrations
-                        }
-                        
-                        // Debug: Check if this is contact 1944 or 644
-                        if (isContact1944 || numericContactId == '644') {
-                            System.debug('ArloEventRegistrationSync: *** CONTACT ' + numericContactId + ' - Registration ' + registrationId + ' PASSED ALL CHECKS ***');
-                            System.debug('ArloEventRegistrationSync: Event Name: "' + eventData.name + '"');
-                            System.debug('ArloEventRegistrationSync: Event Code: ' + eventData.code);
-                            String campaignName = getCampaignNameForEvent(eventData.name);
-                            System.debug('ArloEventRegistrationSync: Mapped Campaign: ' + (campaignName != null ? campaignName : 'NULL (no match)'));
-                            if (campaignName == 'NHM - Neurodiversity' && numericContactId == '644') {
-                                System.debug('ArloEventRegistrationSync: ⚠️ ⚠️ ⚠️ WARNING: Contact 644 matched to Neurodiversity campaign!');
-                                System.debug('ArloEventRegistrationSync: Event name contains: "' + eventData.name + '"');
-                                System.debug('ArloEventRegistrationSync: Please verify this event name is correct in Arlo.');
-                            }
-                        }
-                        
-                        // Create wrapper for campaign assignment (only for registrations with consent)
-                        ContactEventWrapper wrapper = new ContactEventWrapper();
-                        wrapper.contact = arloContact;
-                        wrapper.eventName = eventData.name;
-                        wrapper.eventCode = eventData.code;
-                        contactEventList.add(wrapper);
-                        totalProcessed++;
-                        processedRegistrationIds.add(registrationId); // Track as processed
-                        
-                        // Debug: Check if this is contact 1944 or 946
-                        if (isContact1944 || isContact946) {
-                            System.debug('ArloEventRegistrationSync: *** CONTACT ' + numericContactId + ' - Created wrapper for registration ' + registrationId + ' ***');
-                            System.debug('ArloEventRegistrationSync: Wrapper contact UUID: "' + (wrapper.contact != null && wrapper.contact.contactId != null ? wrapper.contact.contactId : 'NULL') + '"');
-                            System.debug('ArloEventRegistrationSync: Wrapper contact Email: "' + (wrapper.contact != null && wrapper.contact.email != null ? wrapper.contact.email : 'NULL') + '"');
-                            System.debug('ArloEventRegistrationSync: Wrapper eventName: "' + wrapper.eventName + '"');
-                            System.debug('ArloEventRegistrationSync: Total wrappers in list now: ' + contactEventList.size());
-                            System.debug('ArloEventRegistrationSync: Remaining callouts: ' + (maxCallouts - calloutCount));
-                        }
+                        processedRegistrationIds.add(registrationId);
                     }
-                    
+
                     // Check if all registrations were processed
-                    if (!processedRegistrationIds.containsAll(registrationsToProcess)) {
-                        Set<String> unprocessed = new Set<String>();
-                        for (String regId : registrationsToProcess) {
-                            if (!processedRegistrationIds.contains(regId)) {
-                                unprocessed.add(regId);
-                            }
-                        }
-                        if (!unprocessed.isEmpty()) {
-                            contactsWithUnprocessedRegistrations.put(numericContactId, unprocessed);
-                            System.debug('ArloEventRegistrationSync: ⚠️ Contact ' + numericContactId + ' has ' + unprocessed.size() + ' unprocessed registration(s) - will retry in next batch: ' + unprocessed);
-                        }
+                    Set<String> unprocessed = findUnprocessedRegistrations(registrationsToProcess, processedRegistrationIds);
+                    if (!unprocessed.isEmpty()) {
+                        contactsWithUnprocessedRegistrations.put(numericContactId, unprocessed);
+                        System.debug('ArloEventRegistrationSync: Contact ' + numericContactId + ' has ' + unprocessed.size() + ' unprocessed registration(s) - will retry in next batch');
                     }
-                    
+
                 } catch (Exception e) {
                     totalFailed++;
                     System.debug('ArloEventRegistrationSync: Error processing contact link ' + contactLink + ': ' + e.getMessage());
@@ -487,232 +664,30 @@ public with sharing class ArloEventRegistrationSync {
             }
             
             // STEP 4: NOW DO ALL DML OPERATIONS (after all callouts are complete)
-            
-            // Add contacts to campaigns (DML)
             if (!contactEventList.isEmpty()) {
                 System.debug('ArloEventRegistrationSync: Adding ' + contactEventList.size() + ' contact-event pairs to campaigns');
-                
-                // Debug: Check if contact 1944 wrappers are in the list
-                Integer wrapperCount1944 = 0;
-                for (ContactEventWrapper w : contactEventList) {
-                    if (w.contact != null && w.contact.numericContactId == '1944') {
-                        wrapperCount1944++;
-                        System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Found wrapper #' + wrapperCount1944 + ' in contactEventList ***');
-                        System.debug('ArloEventRegistrationSync: UUID: "' + (w.contact.contactId != null ? w.contact.contactId : 'NULL') + '", Email: "' + (w.contact.email != null ? w.contact.email : 'NULL') + '", Event: "' + w.eventName + '"');
-                    }
-                }
-                if (wrapperCount1944 > 0) {
-                    System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Total ' + wrapperCount1944 + ' wrapper(s) in contactEventList ***');
-                }
-                
+
                 try {
                     // Find Salesforce contacts for each Arlo contact
                     Map<Id, Contact> syncedContactMap = findSalesforceContactsForArloContacts(contactEventList, arloContactMap);
-                    
-                    // Debug: Check if contact 1944 was found in syncedContactMap
-                    Boolean found1944InSynced = false;
-                    for (Contact c : syncedContactMap.values()) {
-                        if ((c.Arlo_Contact_UUID__c != null && c.Arlo_Contact_UUID__c.contains('9b4c8fc8-eff0-4c04-a7b3-535fe95a23ff')) ||
-                            (c.Email != null && c.Email == 'kavanagha@hautapu.school.nz')) {
-                            found1944InSynced = true;
-                            System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Found in syncedContactMap: ' + c.Id + ' ***');
-                            break;
-                        }
-                    }
-                    if (wrapperCount1944 > 0 && !found1944InSynced) {
-                        System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - WARNING: Wrappers exist but contact NOT found in syncedContactMap! ***');
-                    }
-                    
-                    // STEP 4a: Create missing contacts in Salesforce (for Active contacts only)
-                    List<ContactEventWrapper> unmatchedWrappers = new List<ContactEventWrapper>();
-                    Set<String> matchedUuids = new Set<String>();
-                    Set<String> matchedEmails = new Set<String>();
-                    
-                    for (Contact c : syncedContactMap.values()) {
-                        if (String.isNotBlank(c.Arlo_Contact_UUID__c)) {
-                            matchedUuids.add(c.Arlo_Contact_UUID__c.trim().toLowerCase());
-                        }
-                        if (String.isNotBlank(c.Email)) {
-                            matchedEmails.add(c.Email.toLowerCase().trim());
-                        }
-                    }
-                    
-                    // Find unmatched contacts (need to be created)
-                    for (ContactEventWrapper wrapper : contactEventList) {
-                        if (wrapper.contact != null) {
-                            Boolean isMatched = false;
-                            String wrapperUuid = wrapper.contact.contactId != null ? wrapper.contact.contactId.trim().toLowerCase() : '';
-                            String wrapperEmail = wrapper.contact.email != null ? wrapper.contact.email.toLowerCase().trim() : '';
-                            
-                            if ((String.isNotBlank(wrapperUuid) && matchedUuids.contains(wrapperUuid)) ||
-                                (String.isNotBlank(wrapperEmail) && matchedEmails.contains(wrapperEmail))) {
-                                isMatched = true;
-                            }
-                            
-                            if (!isMatched) {
-                                unmatchedWrappers.add(wrapper);
-                            }
-                        }
-                    }
-                    
-                    // Create missing contacts (only for Active contacts - we already filtered by Active status earlier)
+
+                    // Find unmatched contacts that need to be created
+                    List<ContactEventWrapper> unmatchedWrappers = findUnmatchedWrappers(contactEventList, syncedContactMap);
+
+                    // Create missing contacts using helper method
                     if (!unmatchedWrappers.isEmpty()) {
-                        System.debug('ArloEventRegistrationSync: Found ' + unmatchedWrappers.size() + ' unmatched contact(s) - will create in Salesforce');
-                        
-                        // Group by numeric contact ID to avoid duplicate fetches
-                        // We need to reverse-map: find numeric ID from UUID/Email in arloContactMap
-                        Map<String, ContactEventWrapper> numericIdToWrapper = new Map<String, ContactEventWrapper>();
-                        Map<String, String> uuidToNumericId = new Map<String, String>();
-                        Map<String, String> emailToNumericId = new Map<String, String>();
-                        
-                        // Build reverse maps from arloContactMap
-                        for (String numericId : arloContactMap.keySet()) {
-                            ArloContactSync.ArloContact ac = arloContactMap.get(numericId);
-                            if (ac != null) {
-                                if (String.isNotBlank(ac.contactId)) {
-                                    uuidToNumericId.put(ac.contactId.trim().toLowerCase(), numericId);
-                                }
-                                if (String.isNotBlank(ac.email)) {
-                                    emailToNumericId.put(ac.email.toLowerCase().trim(), numericId);
-                                }
-                            }
-                        }
-                        
-                        // Map unmatched wrappers to their numeric IDs
-                        for (ContactEventWrapper wrapper : unmatchedWrappers) {
-                            String numericId = null;
-                            if (wrapper.contact != null) {
-                                String wrapperUuid = wrapper.contact.contactId != null ? wrapper.contact.contactId.trim().toLowerCase() : '';
-                                String wrapperEmail = wrapper.contact.email != null ? wrapper.contact.email.toLowerCase().trim() : '';
-                                
-                                if (String.isNotBlank(wrapperUuid) && uuidToNumericId.containsKey(wrapperUuid)) {
-                                    numericId = uuidToNumericId.get(wrapperUuid);
-                                } else if (String.isNotBlank(wrapperEmail) && emailToNumericId.containsKey(wrapperEmail)) {
-                                    numericId = emailToNumericId.get(wrapperEmail);
-                                }
-                                
-                                if (String.isNotBlank(numericId) && !numericIdToWrapper.containsKey(numericId)) {
-                                    numericIdToWrapper.put(numericId, wrapper);
-                                }
-                            }
-                        }
-                        
-                        // IMPORTANT: Contact creation is critical - we MUST create these contacts
-                        // These contacts have valid registrations (NHM events + email consent) and MUST be created
-                        // Even if we're low on callouts, we should try to create at least some contacts
-                        // If we can't create all, we'll defer the rest to the next batch
-                        Integer availableCallouts = maxCallouts - calloutCount;
-                        System.debug('ArloEventRegistrationSync: ===== CONTACT CREATION PHASE =====');
-                        System.debug('ArloEventRegistrationSync: Available callouts for contact creation: ' + availableCallouts + ' (need ' + (numericIdToWrapper.size() * 3) + ' for all ' + numericIdToWrapper.size() + ' contacts)');
-                        System.debug('ArloEventRegistrationSync: Unmatched contacts to create: ' + numericIdToWrapper.size());
-                        
-                        // Calculate how many contacts we can create with available callouts
-                        // Each contact needs 3 callouts (contact + employment + org)
-                        Integer contactsToCreateCount = 0;
-                        if (availableCallouts >= 6) {
-                            // Reserve 3 callouts for safety, use the rest for contact creation
-                            contactsToCreateCount = (availableCallouts - 3) / 3;
-                            if (contactsToCreateCount > numericIdToWrapper.size()) {
-                                contactsToCreateCount = numericIdToWrapper.size(); // Can create all
-                            }
-                        }
-                        
-                        if (contactsToCreateCount == 0) {
-                            System.debug('ArloEventRegistrationSync: ⚠️ WARNING: Not enough callout budget to create contacts (available: ' + availableCallouts + ')');
-                            System.debug('ArloEventRegistrationSync: ⚠️ ' + numericIdToWrapper.size() + ' contact(s) with valid registrations will NOT be created in this batch');
-                            System.debug('ArloEventRegistrationSync: ⚠️ These contacts will be created in the next full sync run');
-                            System.debug('ArloEventRegistrationSync: ⚠️ RECOMMENDATION: Run the full sync again to create these contacts');
-                        } else if (contactsToCreateCount < numericIdToWrapper.size()) {
-                            System.debug('ArloEventRegistrationSync: Limited callout budget - will create ' + contactsToCreateCount + ' of ' + numericIdToWrapper.size() + ' unmatched contact(s) in this batch');
-                            System.debug('ArloEventRegistrationSync: Remaining ' + (numericIdToWrapper.size() - contactsToCreateCount) + ' contact(s) will be created in next batch or next full sync');
-                            
-                            // Limit to contacts we can create now
-                            List<String> numericIdsToProcess = new List<String>(numericIdToWrapper.keySet());
-                            for (Integer i = contactsToCreateCount; i < numericIdsToProcess.size(); i++) {
-                                numericIdToWrapper.remove(numericIdsToProcess[i]);
-                            }
-                        } else {
-                            System.debug('ArloEventRegistrationSync: ✓ Sufficient callout budget - will create all ' + numericIdToWrapper.size() + ' unmatched contact(s)');
-                        }
-                        
-                        // Fetch full contact details (including employment) for unmatched contacts
-                        List<ArloContactSync.ArloContact> contactsToCreate = new List<ArloContactSync.ArloContact>();
-                        
-                        for (String numericContactId : numericIdToWrapper.keySet()) {
-                            // Check callout count before each fetch
-                            Integer remainingCallouts = maxCallouts - calloutCount;
-                            if (remainingCallouts < 5) {
-                                System.debug('ArloEventRegistrationSync: Reached callout limit - stopping contact creation (remaining: ' + remainingCallouts + ')');
-                                System.debug('ArloEventRegistrationSync: Will create remaining contacts in next batch');
-                                break;
-                            }
-                            
-                            // Fetch full contact details with employment data (3 callouts: contact + employment + org)
-                            System.debug('ArloEventRegistrationSync: Fetching full contact details for ID ' + numericContactId + ' to create in Salesforce (callout count: ' + calloutCount + ', remaining: ' + remainingCallouts + ')');
-                            ArloContactSync.ArloContact fullContact = ArloContactSync.getSingleArloContactStatic(numericContactId, username, password);
-                            calloutCount += 3; // getSingleArloContactStatic makes 3 callouts
-                            
-                            if (fullContact != null && String.isNotBlank(fullContact.organisationCodePrimary)) {
-                                contactsToCreate.add(fullContact);
-                                System.debug('ArloEventRegistrationSync: ✓ Contact ' + numericContactId + ' will be created with Account CodePrimary: ' + fullContact.organisationCodePrimary);
-                            } else {
-                                System.debug('ArloEventRegistrationSync: ⚠️ Cannot create contact ' + numericContactId + ' - no organisation CodePrimary found');
-                            }
-                        }
-                        
-                        // Create contacts in Salesforce (grouped by Account)
-                        if (!contactsToCreate.isEmpty()) {
-                            Map<String, List<ArloContactSync.ArloContact>> contactsByAccount = new Map<String, List<ArloContactSync.ArloContact>>();
-                            
-                            for (ArloContactSync.ArloContact ac : contactsToCreate) {
-                                if (String.isNotBlank(ac.organisationCodePrimary)) {
-                                    if (!contactsByAccount.containsKey(ac.organisationCodePrimary)) {
-                                        contactsByAccount.put(ac.organisationCodePrimary, new List<ArloContactSync.ArloContact>());
-                                    }
-                                    contactsByAccount.get(ac.organisationCodePrimary).add(ac);
-                                }
-                            }
-                            
-                            // Create contacts for each Account
-                            for (String codePrimary : contactsByAccount.keySet()) {
-                                Account sfAccount = getSalesforceAccountByNumberStatic(codePrimary);
-                                if (sfAccount != null) {
-                                    List<ArloContactSync.ArloContact> accountContacts = contactsByAccount.get(codePrimary);
-                                    System.debug('ArloEventRegistrationSync: Creating ' + accountContacts.size() + ' contact(s) for Account: ' + sfAccount.Name);
-                                    ArloContactSync.syncContactsToSalesforceStatic(accountContacts, sfAccount.Id);
-                                    
-                                    // Query for newly created contacts
-                                    Set<String> newContactUuids = new Set<String>();
-                                    Set<String> newContactEmails = new Set<String>();
-                                    for (ArloContactSync.ArloContact ac : accountContacts) {
-                                        if (String.isNotBlank(ac.contactId)) {
-                                            newContactUuids.add(ac.contactId);
-                                        }
-                                        if (String.isNotBlank(ac.email)) {
-                                            newContactEmails.add(ac.email);
-                                        }
-                                    }
-                                    
-                                    List<Contact> newlyCreatedContacts = [
-                                        SELECT Id, FirstName, LastName, Email, Arlo_Contact_UUID__c
-                                        FROM Contact
-                                        WHERE (Arlo_Contact_UUID__c IN :newContactUuids AND Arlo_Contact_UUID__c != null)
-                                           OR (Email IN :newContactEmails AND Email != null)
-                                    ];
-                                    
-                                    for (Contact c : newlyCreatedContacts) {
-                                        syncedContactMap.put(c.Id, c);
-                                    }
-                                    
-                                    System.debug('ArloEventRegistrationSync: Successfully created ' + newlyCreatedContacts.size() + ' contact(s)');
-                                } else {
-                                    System.debug('ArloEventRegistrationSync: ⚠️ Cannot create contacts - Account not found for CodePrimary: ' + codePrimary);
-                                }
-                            }
-                        }
+                        calloutCount = createContactsInSalesforce(
+                            unmatchedWrappers,
+                            arloContactMap,
+                            syncedContactMap,
+                            username,
+                            password,
+                            calloutCount,
+                            maxCallouts
+                        );
                     }
-                    
-                    // STEP 4b: Now add all contacts (existing + newly created) to campaigns
+
+                    // Add all contacts (existing + newly created) to campaigns
                     System.debug('ArloEventRegistrationSync: ===== STARTING CAMPAIGN ASSIGNMENT =====');
                     System.debug('ArloEventRegistrationSync: Contact-event pairs to process: ' + contactEventList.size());
                     System.debug('ArloEventRegistrationSync: Salesforce contacts available: ' + syncedContactMap.size());
@@ -739,9 +714,10 @@ public with sharing class ArloEventRegistrationSync {
                     if (log.Records_Successful__c != null) prevSuccessful = Integer.valueOf(log.Records_Successful__c);
                     if (log.Records_Failed__c != null) prevFailed = Integer.valueOf(log.Records_Failed__c);
                 } catch (Exception e) {
-                    System.debug('ArloEventRegistrationSync: Could not get previous totals: ' + e.getMessage());
+                    System.debug('ArloEventRegistrationSync: Could not get previous totals for log ID ' + logId + ': ' + e.getMessage());
+                    System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
                 }
-                
+
                 Integer cumulativeProcessed = prevProcessed + totalProcessed;
                 Integer cumulativeSuccessful = prevSuccessful + totalSuccessful;
                 Integer cumulativeFailed = prevFailed + totalFailed;
@@ -754,7 +730,7 @@ public with sharing class ArloEventRegistrationSync {
                     String chainMessage = batchMessage;
                     if (!contactsWithUnprocessedRegistrations.isEmpty()) {
                         chainMessage += ' ' + contactsWithUnprocessedRegistrations.size() + ' contact(s) with unprocessed registrations will be retried.';
-                        System.debug('ArloEventRegistrationSync: ⚠️ Contacts with unprocessed registrations: ' + contactsWithUnprocessedRegistrations.keySet());
+                        System.debug('ArloEventRegistrationSync: Contacts with unprocessed registrations: ' + contactsWithUnprocessedRegistrations.keySet());
                         for (String contactId : contactsWithUnprocessedRegistrations.keySet()) {
                             Set<String> regIds = contactsWithUnprocessedRegistrations.get(contactId);
                             System.debug('ArloEventRegistrationSync:   - Contact ' + contactId + ': ' + regIds.size() + ' unprocessed registration(s): ' + regIds);
@@ -774,10 +750,11 @@ public with sharing class ArloEventRegistrationSync {
                         System.debug('ArloEventRegistrationSync: Deferring contact ' + contactId + ' with ' + regIds.size() + ' unprocessed registration(s)');
                     }
                     
-                    ArloContactRegistrationSyncQueueable nextQueueable = new ArloContactRegistrationSyncQueueable(
-                        contactLinks, username, password, logId, endIndex, deferredContacts
-                    );
-                    System.enqueueJob(nextQueueable);
+                    // Note: For full sync use ArloRegistrationSyncBatch
+                    System.debug('ArloEventRegistrationSync: Additional processing needed - use batch class instead');
+                    updateLogRecordStatic(logId, 'Completed with Errors',
+                        'Partial processing completed. Use ArloRegistrationSyncBatch for full sync.',
+                        null, cumulativeProcessed, cumulativeSuccessful);
                 } else {
                     // All contacts processed and no unprocessed registrations
                     String finalMessage = 'Completed! Processed ' + contactsProcessed + ' contacts (' + activeContactsProcessed + ' active) in final batch. Total: ' + cumulativeProcessed + ' contact-event pairs. Successfully added ' + cumulativeSuccessful + ' to campaigns. Failed: ' + cumulativeFailed;
@@ -808,6 +785,7 @@ public with sharing class ArloEventRegistrationSync {
      * Get all event links from the events endpoint
      * Handles pagination by following "next" links
      */
+    @TestVisible
     private static List<String> getAllEventLinks() {
         return getAllEventLinksStatic(arloUsername, arloPassword);
     }
@@ -827,7 +805,8 @@ public with sharing class ArloEventRegistrationSync {
             arloPassword = originalPassword;
         }
     }
-    
+
+    @TestVisible
     private static List<String> getAllEventLinksInternal() {
         List<String> allEventLinks = new List<String>();
         String nextLink = ARLO_API_BASE_URL + '/resources/events/';
@@ -846,25 +825,8 @@ public with sharing class ArloEventRegistrationSync {
         
         while (String.isNotBlank(nextLink) && pageCount < maxPages) {
             try {
-                System.debug('ArloEventRegistrationSync: Fetching events page ' + (pageCount + 1) + ' from: ' + nextLink);
-                
-                HttpRequest req = new HttpRequest();
-                req.setEndpoint(nextLink);
-                req.setMethod('GET');
-                req.setHeader('Accept', 'application/xml');
-                
-                // Use Basic Authentication
-                Blob authBlob = Blob.valueOf(arloUsername + ':' + arloPassword);
-                String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-                req.setHeader('Authorization', authHeader);
-                
-                req.setTimeout(30000);
-                
-                Http http = new Http();
-                HttpResponse res = http.send(req);
-                
-                System.debug('ArloEventRegistrationSync: Events API response status: ' + res.getStatusCode());
-                
+                HttpResponse res = makeArloRequest(nextLink, arloUsername, arloPassword);
+
                 if (res.getStatusCode() == 200) {
                     String responseBody = res.getBody();
                     System.debug('ArloEventRegistrationSync: Events API response body length: ' + responseBody.length());
@@ -890,11 +852,12 @@ public with sharing class ArloEventRegistrationSync {
                     break;
                 }
             } catch (Exception e) {
-                System.debug('ArloEventRegistrationSync: Error fetching events page: ' + e.getMessage());
+                System.debug('ArloEventRegistrationSync: Error fetching events page at ' + nextLink + ': ' + e.getMessage());
+                System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
                 break;
             }
         }
-        
+
         System.debug('ArloEventRegistrationSync: Total event links found: ' + allEventLinks.size() + ' across ' + (pageCount + 1) + ' pages');
         return allEventLinks;
     }
@@ -916,6 +879,7 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Extract event links from XML response
      */
+    @TestVisible
     private static List<String> extractEventLinksFromCollection(String xmlBody) {
         List<String> eventLinks = new List<String>();
         try {
@@ -926,6 +890,8 @@ public with sharing class ArloEventRegistrationSync {
             findEventLinksRecursive(root, eventLinks);
         } catch (Exception e) {
             System.debug('ArloEventRegistrationSync: Error extracting event links: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: XML body length: ' + (xmlBody != null ? String.valueOf(xmlBody.length()) : 'null'));
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return eventLinks;
     }
@@ -933,6 +899,7 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Recursively find Event Link elements
      */
+    @TestVisible
     private static void findEventLinksRecursive(Dom.XmlNode node, List<String> eventLinks) {
         if (node.getName() == 'Link') {
             String rel = node.getAttributeValue('rel', null);
@@ -953,19 +920,7 @@ public with sharing class ArloEventRegistrationSync {
      * Extract event ID from link
      */
     public static String extractEventIdFromLink(String eventLink) {
-        if (String.isBlank(eventLink)) {
-            return null;
-        }
-        try {
-            Pattern idPattern = Pattern.compile('/events/(\\d+)/');
-            Matcher matcher = idPattern.matcher(eventLink);
-            if (matcher.find()) {
-                return matcher.group(1);
-            }
-        } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error extracting event ID: ' + e.getMessage());
-        }
-        return null;
+        return ArloXmlParser.extractIdFromUrl(eventLink, 'events');
     }
     
     /**
@@ -977,38 +932,22 @@ public with sharing class ArloEventRegistrationSync {
         String nextLink = ARLO_API_BASE_URL + '/resources/contacts/';
         Integer pageCount = 0;
         Integer maxPages = 100; // Safety limit to prevent infinite loops
-        
+
         while (String.isNotBlank(nextLink) && pageCount < maxPages) {
             try {
-                System.debug('ArloEventRegistrationSync: Fetching contacts page ' + (pageCount + 1) + ' from: ' + nextLink);
-                
-                HttpRequest req = new HttpRequest();
-                req.setEndpoint(nextLink);
-                req.setMethod('GET');
-                req.setHeader('Accept', 'application/xml');
-                
-                Blob authBlob = Blob.valueOf(username + ':' + password);
-                String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-                req.setHeader('Authorization', authHeader);
-                
-                req.setTimeout(30000);
-                
-                Http http = new Http();
-                HttpResponse res = http.send(req);
-                
+                HttpResponse res = makeArloRequest(nextLink, username, password);
+
                 if (res.getStatusCode() == 200) {
                     String responseBody = res.getBody();
-                    
+
                     // Extract contact links from XML
                     List<String> pageLinks = extractContactLinksFromCollection(responseBody);
                     allContactLinks.addAll(pageLinks);
                     System.debug('ArloEventRegistrationSync: Found ' + pageLinks.size() + ' contacts on page ' + (pageCount + 1));
-                    
-                    // Check for "next" link for pagination (use regex pattern like existing method)
-                    Pattern nextPattern = Pattern.compile('<Link[^>]*rel="next"[^>]*href="([^"]*)"');
-                    Matcher nextMatcher = nextPattern.matcher(responseBody);
-                    if (nextMatcher.find()) {
-                        nextLink = nextMatcher.group(1);
+
+                    // Check for "next" link for pagination using ArloXmlParser
+                    nextLink = ArloXmlParser.extractNextLink(responseBody);
+                    if (String.isNotBlank(nextLink)) {
                         System.debug('ArloEventRegistrationSync: Found next page link: ' + nextLink);
                         pageCount++;
                     } else {
@@ -1017,22 +956,25 @@ public with sharing class ArloEventRegistrationSync {
                     }
                 } else {
                     System.debug('ArloEventRegistrationSync: Error fetching contacts page. Status: ' + res.getStatusCode());
+                    System.debug('ArloEventRegistrationSync: Response body: ' + res.getBody());
                     break;
                 }
             } catch (Exception e) {
-                System.debug('ArloEventRegistrationSync: Error fetching contacts page: ' + e.getMessage());
+                System.debug('ArloEventRegistrationSync: Error fetching contacts page at ' + nextLink + ': ' + e.getMessage());
+                System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
                 break;
             }
         }
-        
+
         System.debug('ArloEventRegistrationSync: Total contact links found: ' + allContactLinks.size() + ' across ' + (pageCount + 1) + ' pages');
         return allContactLinks;
     }
     
     /**
      * Extract contact links from XML response
+     * Public static for reuse by ArloRegistrationSyncBatch
      */
-    private static List<String> extractContactLinksFromCollection(String xmlBody) {
+    public static List<String> extractContactLinksFromCollection(String xmlBody) {
         List<String> contactLinks = new List<String>();
         try {
             Dom.Document doc = new Dom.Document();
@@ -1042,14 +984,17 @@ public with sharing class ArloEventRegistrationSync {
             findContactLinksRecursive(root, contactLinks);
         } catch (Exception e) {
             System.debug('ArloEventRegistrationSync: Error extracting contact links: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: XML body length: ' + (xmlBody != null ? String.valueOf(xmlBody.length()) : 'null'));
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return contactLinks;
     }
-    
+
     /**
      * Recursively find Contact Link elements
+     * Public static for reuse by ArloRegistrationSyncBatch
      */
-    private static void findContactLinksRecursive(Dom.XmlNode node, List<String> contactLinks) {
+    public static void findContactLinksRecursive(Dom.XmlNode node, List<String> contactLinks) {
         if (node.getName() == 'Link') {
             String rel = node.getAttributeValue('rel', null);
             // Look for Link with rel containing "Contact" (e.g., "http://schemas.arlo.co/api/2012/02/auth/Contact")
@@ -1068,130 +1013,80 @@ public with sharing class ArloEventRegistrationSync {
     
     /**
      * Extract contact ID from link (e.g., /contacts/300/ -> 300)
+     * Public static for reuse by ArloRegistrationSyncBatch
      */
-    private static String extractContactIdFromLink(String contactLink) {
-        if (String.isBlank(contactLink)) {
-            return null;
-        }
-        try {
-            Pattern idPattern = Pattern.compile('/contacts/(\\d+)/');
-            Matcher matcher = idPattern.matcher(contactLink);
-            if (matcher.find()) {
-                return matcher.group(1);
-            }
-        } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error extracting contact ID: ' + e.getMessage());
-        }
-        return null;
+    public static String extractContactIdFromLink(String contactLink) {
+        return ArloXmlParser.extractIdFromUrl(contactLink, 'contacts');
     }
     
     /**
      * Get contact UUID and Email only (skips employment/org lookups to save callouts)
      * Assumes organization is a school and exists in Salesforce
+     * Public static for reuse by ArloRegistrationSyncBatch
      */
-    private static ArloContactSync.ArloContact getContactUuidAndEmailOnly(String numericContactId, String username, String password) {
+    public static ArloModels.ArloContact getContactUuidAndEmailOnly(String numericContactId, String username, String password) {
         try {
             String endpoint = ARLO_API_BASE_URL + '/resources/contacts/' + numericContactId;
-            
-            HttpRequest req = new HttpRequest();
-            req.setEndpoint(endpoint);
-            req.setMethod('GET');
-            req.setHeader('Accept', 'application/xml');
-            
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            req.setHeader('Authorization', authHeader);
-            
-            req.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse res = http.send(req);
-            
+            HttpResponse res = makeArloRequest(endpoint, username, password);
+
             if (res.getStatusCode() == 200) {
                 String responseBody = res.getBody();
-                
-                // Parse only UUID and Email from XML (skip employment/org to save callouts)
-                ArloContactSync.ArloContact contact = new ArloContactSync.ArloContact();
+
+                // Parse only UUID and Email from XML using ArloXmlParser
+                ArloModels.ArloContact contact = new ArloModels.ArloContact();
                 contact.numericContactId = numericContactId;
-                
+
                 // Extract UniqueIdentifier (UUID)
-                Pattern uuidPattern = Pattern.compile('<UniqueIdentifier>([^<]+)</UniqueIdentifier>');
-                Matcher uuidMatcher = uuidPattern.matcher(responseBody);
-                if (uuidMatcher.find()) {
-                    contact.contactId = uuidMatcher.group(1).trim();
-                }
-                
+                contact.contactId = ArloXmlParser.extractElementValue(responseBody, 'UniqueIdentifier');
+
                 // Extract Email
-                Pattern emailPattern = Pattern.compile('<Email>([^<]+)</Email>');
-                Matcher emailMatcher = emailPattern.matcher(responseBody);
-                if (emailMatcher.find()) {
-                    contact.email = emailMatcher.group(1).trim();
-                }
-                
+                contact.email = ArloXmlParser.extractElementValue(responseBody, 'Email');
+
                 // If no UniqueIdentifier found, try ContactID as fallback
                 if (String.isBlank(contact.contactId)) {
-                    Pattern contactIdPattern = Pattern.compile('<ContactID>([^<]+)</ContactID>');
-                    Matcher contactIdMatcher = contactIdPattern.matcher(responseBody);
-                    if (contactIdMatcher.find()) {
-                        contact.contactId = contactIdMatcher.group(1).trim();
-                    }
+                    contact.contactId = ArloXmlParser.extractElementValue(responseBody, 'ContactID');
                 }
-                
+
                 return contact;
             } else {
-                System.debug('ArloEventRegistrationSync: Error getting contact UUID/Email. Status: ' + res.getStatusCode());
+                System.debug('ArloEventRegistrationSync: Error getting contact UUID/Email for ID ' + numericContactId + '. Status: ' + res.getStatusCode());
+                System.debug('ArloEventRegistrationSync: Response body: ' + res.getBody());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting contact UUID/Email: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting contact UUID/Email for ID ' + numericContactId + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return null;
     }
-    
+
     /**
      * Get contact status from Arlo (returns "Active", "Inactive", etc.)
+     * Public static for reuse by ArloRegistrationSyncBatch
      */
-    private static String getContactStatusStatic(String numericContactId, String username, String password) {
+    public static String getContactStatusStatic(String numericContactId, String username, String password) {
         try {
             String endpoint = ARLO_API_BASE_URL + '/resources/contacts/' + numericContactId;
-            
-            HttpRequest req = new HttpRequest();
-            req.setEndpoint(endpoint);
-            req.setMethod('GET');
-            req.setHeader('Accept', 'application/xml');
-            
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            req.setHeader('Authorization', authHeader);
-            
-            req.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse res = http.send(req);
-            
+            HttpResponse res = makeArloRequest(endpoint, username, password);
+
             if (res.getStatusCode() == 200) {
-                String responseBody = res.getBody();
-                
-                // Extract Status element
-                Pattern statusPattern = Pattern.compile('<Status>([^<]+)</Status>');
-                Matcher matcher = statusPattern.matcher(responseBody);
-                if (matcher.find()) {
-                    return matcher.group(1).trim();
-                }
+                return ArloXmlParser.extractElementValue(res.getBody(), 'Status');
             } else {
-                System.debug('ArloEventRegistrationSync: Error getting contact status. Status: ' + res.getStatusCode());
+                System.debug('ArloEventRegistrationSync: Error getting contact status for ID ' + numericContactId + '. Status: ' + res.getStatusCode());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting contact status: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting contact status for ID ' + numericContactId + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return null;
     }
     
     /**
      * Find Salesforce contacts for Arlo contacts by matching UUID or Email
+     * Public static for reuse by ArloRegistrationSyncBatch
      */
-    private static Map<Id, Contact> findSalesforceContactsForArloContacts(
+    public static Map<Id, Contact> findSalesforceContactsForArloContacts(
         List<ContactEventWrapper> contactEventList,
-        Map<String, ArloContactSync.ArloContact> arloContactMap
+        Map<String, ArloModels.ArloContact> arloContactMap
     ) {
         Map<Id, Contact> syncedContactMap = new Map<Id, Contact>();
         
@@ -1256,7 +1151,7 @@ public with sharing class ArloEventRegistrationSync {
         
         // Debug: Log unmatched contacts
         if (syncedContactMap.size() < contactEventList.size()) {
-            System.debug('ArloEventRegistrationSync: ⚠️ WARNING: Some Arlo contacts were not matched to Salesforce contacts');
+            System.debug('ArloEventRegistrationSync: WARNING: Some Arlo contacts were not matched to Salesforce contacts');
             for (ContactEventWrapper wrapper : contactEventList) {
                 if (wrapper.contact != null) {
                     Boolean found = false;
@@ -1285,6 +1180,7 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Get event details from Arlo API (uses static credentials)
      */
+    @TestVisible
     private static EventData getEventDetails(String eventId) {
         return getEventDetailsStatic(eventId, arloUsername, arloPassword);
     }
@@ -1295,49 +1191,25 @@ public with sharing class ArloEventRegistrationSync {
     public static EventData getEventDetailsStatic(String eventId, String username, String password) {
         try {
             String endpoint = ARLO_API_BASE_URL + '/resources/events/' + eventId;
-            
-            HttpRequest req = new HttpRequest();
-            req.setEndpoint(endpoint);
-            req.setMethod('GET');
-            req.setHeader('Accept', 'application/xml');
-            
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            req.setHeader('Authorization', authHeader);
-            
-            req.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse res = http.send(req);
-            
+            HttpResponse res = makeArloRequest(endpoint, username, password);
+
             if (res.getStatusCode() == 200) {
                 String responseBody = res.getBody();
-                
-                // Parse XML to extract Code
+
+                // Parse XML using ArloXmlParser
                 EventData eventData = new EventData();
                 eventData.eventId = eventId;
-                
-                // Extract Code from XML
-                Pattern codePattern = Pattern.compile('<Code>(.*?)</Code>');
-                Matcher matcher = codePattern.matcher(responseBody);
-                if (matcher.find()) {
-                    eventData.code = matcher.group(1);
-                }
-                
-                // Extract Name from XML
-                Pattern namePattern = Pattern.compile('<Name>(.*?)</Name>');
-                Matcher nameMatcher = namePattern.matcher(responseBody);
-                if (nameMatcher.find()) {
-                    eventData.name = nameMatcher.group(1);
-                }
-                
+                eventData.code = ArloXmlParser.extractElementValue(responseBody, 'Code');
+                eventData.name = ArloXmlParser.extractElementValue(responseBody, 'Name');
+
                 return eventData;
             } else {
-                System.debug('ArloEventRegistrationSync: Error getting event details. Status: ' + res.getStatusCode());
+                System.debug('ArloEventRegistrationSync: Error getting event details for event ID ' + eventId + '. Status: ' + res.getStatusCode());
                 return null;
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting event details: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting event details for event ID ' + eventId + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
             return null;
         }
     }
@@ -1345,6 +1217,7 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Get registration links for an event (uses static credentials)
      */
+    @TestVisible
     private static List<String> getRegistrationLinks(String eventId) {
         return getRegistrationLinksStatic(eventId, arloUsername, arloPassword);
     }
@@ -1358,40 +1231,21 @@ public with sharing class ArloEventRegistrationSync {
         String nextLink = ARLO_API_BASE_URL + '/resources/events/' + eventId + '/registrations';
         Integer pageCount = 0;
         Integer maxPages = 100; // Safety limit to prevent infinite loops
-        
+
         while (String.isNotBlank(nextLink) && pageCount < maxPages) {
             try {
-                System.debug('ArloEventRegistrationSync: Fetching registrations page ' + (pageCount + 1) + ' for event ' + eventId + ' from: ' + nextLink);
-                
-                HttpRequest req = new HttpRequest();
-                req.setEndpoint(nextLink);
-                req.setMethod('GET');
-                req.setHeader('Accept', 'application/xml');
-                
-                Blob authBlob = Blob.valueOf(username + ':' + password);
-                String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-                req.setHeader('Authorization', authHeader);
-                
-                req.setTimeout(30000);
-                
-                Http http = new Http();
-                HttpResponse res = http.send(req);
-                
+                HttpResponse res = makeArloRequest(nextLink, username, password);
+
                 if (res.getStatusCode() == 200) {
                     String responseBody = res.getBody();
-                    
-                    // Parse XML to extract registration links
-                    Pattern linkPattern = Pattern.compile('<Link[^>]*href="([^"]*registrations/\\d+/)"[^>]*>');
-                    Matcher matcher = linkPattern.matcher(responseBody);
-                    Integer pageRegCount = 0;
-                    while (matcher.find()) {
-                        allRegistrationLinks.add(matcher.group(1));
-                        pageRegCount++;
-                    }
-                    System.debug('ArloEventRegistrationSync: Found ' + pageRegCount + ' registrations on page ' + (pageCount + 1) + ' for event ' + eventId);
-                    
+
+                    // Parse XML to extract registration links using ArloXmlParser
+                    List<String> pageLinks = ArloXmlParser.extractResourceLinks(responseBody, 'registrations');
+                    allRegistrationLinks.addAll(pageLinks);
+                    System.debug('ArloEventRegistrationSync: Found ' + pageLinks.size() + ' registrations on page ' + (pageCount + 1) + ' for event ' + eventId);
+
                     // Check for "next" link for pagination
-                    nextLink = extractNextLink(responseBody);
+                    nextLink = ArloXmlParser.extractNextLink(responseBody);
                     if (String.isNotBlank(nextLink)) {
                         System.debug('ArloEventRegistrationSync: Found next page link for event ' + eventId + ' registrations: ' + nextLink);
                         pageCount++;
@@ -1405,10 +1259,11 @@ public with sharing class ArloEventRegistrationSync {
                 }
             } catch (Exception e) {
                 System.debug('ArloEventRegistrationSync: Error getting registrations for event ' + eventId + ': ' + e.getMessage());
+                System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
                 break;
             }
         }
-        
+
         System.debug('ArloEventRegistrationSync: Total registration links found for event ' + eventId + ': ' + allRegistrationLinks.size() + ' across ' + (pageCount + 1) + ' pages');
         return allRegistrationLinks;
     }
@@ -1417,24 +1272,13 @@ public with sharing class ArloEventRegistrationSync {
      * Extract registration ID from link
      */
     public static String extractRegistrationIdFromLink(String registrationLink) {
-        if (String.isBlank(registrationLink)) {
-            return null;
-        }
-        try {
-            Pattern idPattern = Pattern.compile('/registrations/(\\d+)/');
-            Matcher matcher = idPattern.matcher(registrationLink);
-            if (matcher.find()) {
-                return matcher.group(1);
-            }
-        } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error extracting registration ID: ' + e.getMessage());
-        }
-        return null;
+        return ArloXmlParser.extractIdFromUrl(registrationLink, 'registrations');
     }
     
     /**
      * Check if registration has email consent (uses static credentials)
      */
+    @TestVisible
     private static Boolean checkRegistrationEmailConsent(String registrationId) {
         return checkRegistrationEmailConsentStatic(registrationId, arloUsername, arloPassword);
     }
@@ -1446,62 +1290,33 @@ public with sharing class ArloEventRegistrationSync {
     public static Boolean checkRegistrationEmailConsentStatic(String registrationId, String username, String password) {
         try {
             String endpoint = ARLO_API_BASE_URL + '/resources/registrations/' + registrationId + '/customfields';
-            
-            HttpRequest req = new HttpRequest();
-            req.setEndpoint(endpoint);
-            req.setMethod('GET');
-            req.setHeader('Accept', 'application/xml');
-            
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            req.setHeader('Authorization', authHeader);
-            
-            req.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse res = http.send(req);
-            
+            HttpResponse res = makeArloRequest(endpoint, username, password);
+
             if (res.getStatusCode() == 200) {
                 String responseBody = res.getBody();
-                System.debug('ArloEventRegistrationSync: Custom fields response for registration ' + registrationId + ': ' + (responseBody.length() > 1000 ? responseBody.substring(0, 1000) : responseBody));
-                
+
                 // Parse XML to find the field 'imhappytobeemailedaboutlifeeducationtrustnews'
-                // XML structure:
-                // <CustomFields>
-                //     <Field>
-                //         <Name>imhappytobeemailedaboutlifeeducationtrustnews</Name>
-                //         <Value>
-                //             <Boolean>true</Boolean>
-                //         </Value>
-                //     </Field>
-                // </CustomFields>
-                
                 try {
                     Dom.Document doc = new Dom.Document();
                     doc.load(responseBody);
-                    
                     Dom.XmlNode root = doc.getRootElement();
-                    System.debug('ArloEventRegistrationSync: Root element name: ' + root.getName());
-                    
+
                     // Recursively search for Field elements
                     Boolean result = findEmailConsentField(root);
-                    System.debug('ArloEventRegistrationSync: Email consent check result for registration ' + registrationId + ': ' + (result != null ? String.valueOf(result) : 'null'));
                     // If result is null (field not found), return false; otherwise return the boolean value
                     return (result != null && result == true);
-                    
+
                 } catch (Exception e) {
-                    System.debug('ArloEventRegistrationSync: Error parsing custom fields XML: ' + e.getMessage());
-                    System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
-                    System.debug('ArloEventRegistrationSync: Response body (first 2000 chars): ' + (responseBody.length() > 2000 ? responseBody.substring(0, 2000) : responseBody));
-                    // Try regex as fallback
-                    System.debug('ArloEventRegistrationSync: Falling back to regex parsing');
+                    // XML parsing failed - try regex as fallback
+                    System.debug('ArloEventRegistrationSync: XML parsing failed for registration ' + registrationId + ', trying regex fallback: ' + e.getMessage());
                     return checkEmailConsentWithRegex(responseBody);
                 }
             } else {
-                System.debug('ArloEventRegistrationSync: Error getting custom fields. Status: ' + res.getStatusCode());
+                System.debug('ArloEventRegistrationSync: Error getting custom fields for registration ' + registrationId + '. Status: ' + res.getStatusCode());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting custom fields: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting custom fields for registration ' + registrationId + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return false; // Default to false if we can't determine
     }
@@ -1510,50 +1325,46 @@ public with sharing class ArloEventRegistrationSync {
      * Recursively find the email consent field in XML
      * Handles various XML structures and whitespace variations
      */
+    @TestVisible
     private static Boolean findEmailConsentField(Dom.XmlNode node) {
         String nodeName = node.getName();
-        
+
         // Handle namespaces in node name
         if (nodeName.contains(':')) {
             nodeName = nodeName.substring(nodeName.indexOf(':') + 1);
         }
-        
+
         // Check if this is a Field element
         if (nodeName == 'Field') {
             String fieldName = null;
             Boolean fieldValue = false;
             Boolean hasBooleanValue = false;
-            
+
             // Look for Name and Value elements
             for (Dom.XmlNode child : node.getChildElements()) {
                 String childName = child.getName();
-                
+
                 // Handle namespaces
                 if (childName.contains(':')) {
                     childName = childName.substring(childName.indexOf(':') + 1);
                 }
-                
+
                 if (childName == 'Name') {
-                    // Get text and trim whitespace
                     String nameText = child.getText();
                     if (nameText != null) {
                         fieldName = nameText.trim();
-                        System.debug('ArloEventRegistrationSync: Found Field with Name: "' + fieldName + '"');
                     }
                 } else if (childName == 'Value') {
-                    // Look for Boolean element inside Value
-                    // Also check if Value directly contains text (some XML structures)
+                    // Check if Value directly contains text
                     String valueText = child.getText();
                     if (valueText != null && valueText.trim() != '') {
-                        // Value might contain text directly
                         String trimmedValue = valueText.trim().toLowerCase();
                         if (trimmedValue == 'true' || trimmedValue == 'false') {
                             fieldValue = (trimmedValue == 'true');
                             hasBooleanValue = true;
-                            System.debug('ArloEventRegistrationSync: Found Boolean value directly in Value: ' + trimmedValue);
                         }
                     }
-                    
+
                     // Also check child elements for Boolean
                     for (Dom.XmlNode valueChild : child.getChildElements()) {
                         String valueChildName = valueChild.getName();
@@ -1563,33 +1374,20 @@ public with sharing class ArloEventRegistrationSync {
                         if (valueChildName == 'Boolean') {
                             String boolText = valueChild.getText();
                             if (boolText != null) {
-                                String trimmedBool = boolText.trim();
-                                fieldValue = (trimmedBool.toLowerCase() == 'true');
+                                fieldValue = (boolText.trim().toLowerCase() == 'true');
                                 hasBooleanValue = true;
-                                System.debug('ArloEventRegistrationSync: Found Boolean element with value: "' + trimmedBool + '" (parsed as: ' + fieldValue + ')');
                             }
                         }
                     }
                 }
             }
-            
-            // Check if this is the field we're looking for (case-insensitive and trimmed)
-            if (fieldName != null) {
-                String trimmedFieldName = fieldName.trim();
-                if (trimmedFieldName.equalsIgnoreCase('imhappytobeemailedaboutlifeeducationtrustnews')) {
-                    if (hasBooleanValue) {
-                        System.debug('ArloEventRegistrationSync: ✓ Found email consent field - value: ' + fieldValue);
-                        return fieldValue;
-                    } else {
-                        System.debug('ArloEventRegistrationSync: ✓ Found email consent field but no Boolean value - returning false');
-                        return false;
-                    }
-                } else {
-                    System.debug('ArloEventRegistrationSync: Field name "' + trimmedFieldName + '" does not match email consent field - continuing search');
-                }
+
+            // Check if this is the field we're looking for (case-insensitive)
+            if (fieldName != null && fieldName.equalsIgnoreCase('imhappytobeemailedaboutlifeeducationtrustnews')) {
+                return hasBooleanValue ? fieldValue : false;
             }
         }
-        
+
         // Recursively search child elements
         for (Dom.XmlNode child : node.getChildElements()) {
             Boolean result = findEmailConsentField(child);
@@ -1597,7 +1395,7 @@ public with sharing class ArloEventRegistrationSync {
                 return result;
             }
         }
-        
+
         return null;
     }
     
@@ -1605,44 +1403,34 @@ public with sharing class ArloEventRegistrationSync {
      * Fallback method to check email consent using regex
      * Handles various XML structures with whitespace and newlines
      */
+    @TestVisible
     private static Boolean checkEmailConsentWithRegex(String xmlBody) {
         try {
-            // Multiple regex patterns to handle different XML structures
             // Pattern 1: Standard structure with Boolean element
-            // <Name>imhappytobeemailedaboutlifeeducationtrustnews</Name>...<Value>...<Boolean>true</Boolean>
             Pattern pattern1 = Pattern.compile('(?i)<Name>\\s*imhappytobeemailedaboutlifeeducationtrustnews\\s*</Name>\\s*<Value>\\s*<Boolean>\\s*(true|false)\\s*</Boolean>');
             Matcher matcher1 = pattern1.matcher(xmlBody);
             if (matcher1.find()) {
                 String boolValue = matcher1.group(1);
-                Boolean result = (boolValue != null && boolValue.trim().toLowerCase() == 'true');
-                System.debug('ArloEventRegistrationSync: Found email consent field via regex (pattern 1) - value: ' + result);
-                return result;
+                return (boolValue != null && boolValue.trim().toLowerCase() == 'true');
             }
-            
+
             // Pattern 2: Value contains text directly (no Boolean element)
-            // <Name>imhappytobeemailedaboutlifeeducationtrustnews</Name>...<Value>true</Value>
             Pattern pattern2 = Pattern.compile('(?i)<Name>\\s*imhappytobeemailedaboutlifeeducationtrustnews\\s*</Name>\\s*<Value>\\s*(true|false)\\s*</Value>');
             Matcher matcher2 = pattern2.matcher(xmlBody);
             if (matcher2.find()) {
                 String boolValue = matcher2.group(1);
-                Boolean result = (boolValue != null && boolValue.trim().toLowerCase() == 'true');
-                System.debug('ArloEventRegistrationSync: Found email consent field via regex (pattern 2) - value: ' + result);
-                return result;
+                return (boolValue != null && boolValue.trim().toLowerCase() == 'true');
             }
-            
+
             // Pattern 3: More flexible - allows any whitespace/newlines between elements
             Pattern pattern3 = Pattern.compile('(?i)<Name>\\s*imhappytobeemailedaboutlifeeducationtrustnews\\s*</Name>[\\s\\S]*?<Value>[\\s\\S]*?<Boolean>\\s*(true|false)\\s*</Boolean>');
             Matcher matcher3 = pattern3.matcher(xmlBody);
             if (matcher3.find()) {
                 String boolValue = matcher3.group(1);
-                Boolean result = (boolValue != null && boolValue.trim().toLowerCase() == 'true');
-                System.debug('ArloEventRegistrationSync: Found email consent field via regex (pattern 3) - value: ' + result);
-                return result;
+                return (boolValue != null && boolValue.trim().toLowerCase() == 'true');
             }
-            
-            System.debug('ArloEventRegistrationSync: Email consent field not found via regex in response body');
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error in regex check: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error in regex check for email consent: ' + e.getMessage());
             System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return false;
@@ -1651,6 +1439,7 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Get contact ID from registration (uses static credentials)
      */
+    @TestVisible
     private static String getContactIdFromRegistration(String registrationId) {
         return getContactIdFromRegistrationStatic(registrationId, arloUsername, arloPassword);
     }
@@ -1661,74 +1450,38 @@ public with sharing class ArloEventRegistrationSync {
     public static String getContactIdFromRegistrationStatic(String registrationId, String username, String password) {
         try {
             String endpoint = ARLO_API_BASE_URL + '/resources/registrations/' + registrationId;
-            
-            HttpRequest req = new HttpRequest();
-            req.setEndpoint(endpoint);
-            req.setMethod('GET');
-            req.setHeader('Accept', 'application/xml');
-            
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            req.setHeader('Authorization', authHeader);
-            
-            req.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse res = http.send(req);
-            
+            HttpResponse res = makeArloRequest(endpoint, username, password);
+
             if (res.getStatusCode() == 200) {
-                String responseBody = res.getBody();
-                
-                // Extract contact link from registration XML
-                Pattern contactPattern = Pattern.compile('<Link[^>]*rel="[^"]*Contact"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                Matcher matcher = contactPattern.matcher(responseBody);
-                if (matcher.find()) {
-                    return matcher.group(1);
-                }
+                // Extract contact ID from registration XML using ArloXmlParser
+                return ArloXmlParser.extractIdFromLinkByRel(res.getBody(), 'Contact', 'contacts');
             } else {
-                System.debug('ArloEventRegistrationSync: Error getting registration details. Status: ' + res.getStatusCode());
+                System.debug('ArloEventRegistrationSync: Error getting registration details for registration ' + registrationId + '. Status: ' + res.getStatusCode());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting registration details: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting registration details for registration ' + registrationId + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return null;
     }
-    
+
     /**
      * Get event ID from a registration
      */
     public static String getEventIdFromRegistrationStatic(String registrationId, String username, String password) {
         try {
             String endpoint = ARLO_API_BASE_URL + '/resources/registrations/' + registrationId;
-            
-            HttpRequest req = new HttpRequest();
-            req.setEndpoint(endpoint);
-            req.setMethod('GET');
-            req.setHeader('Accept', 'application/xml');
-            
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            req.setHeader('Authorization', authHeader);
-            
-            req.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse res = http.send(req);
-            
+            HttpResponse res = makeArloRequest(endpoint, username, password);
+
             if (res.getStatusCode() == 200) {
-                String responseBody = res.getBody();
-                
-                // Extract event link from registration XML
-                Pattern eventPattern = Pattern.compile('<Link[^>]*rel="[^"]*Event"[^>]*href="[^"]*/events/(\\d+)/"');
-                Matcher matcher = eventPattern.matcher(responseBody);
-                if (matcher.find()) {
-                    return matcher.group(1);
-                }
+                // Extract event ID from registration XML using ArloXmlParser
+                return ArloXmlParser.extractIdFromLinkByRel(res.getBody(), 'Event', 'events');
             } else {
-                System.debug('ArloEventRegistrationSync: Error getting registration details. Status: ' + res.getStatusCode());
+                System.debug('ArloEventRegistrationSync: Error getting registration details for registration ' + registrationId + '. Status: ' + res.getStatusCode());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting event ID from registration: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting event ID from registration ' + registrationId + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return null;
     }
@@ -1736,6 +1489,7 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Get organisation CodePrimary from organisation endpoint (uses static credentials)
      */
+    @TestVisible
     private static String getOrganisationCodePrimary(String organisationId) {
         return getOrganisationCodePrimaryStatic(organisationId, arloUsername, arloPassword);
     }
@@ -1746,92 +1500,28 @@ public with sharing class ArloEventRegistrationSync {
     public static String getOrganisationCodePrimaryStatic(String organisationId, String username, String password) {
         try {
             String endpoint = ARLO_API_BASE_URL + '/resources/organisations/' + organisationId;
-            System.debug('ArloEventRegistrationSync: Fetching organisation CodePrimary from: ' + endpoint);
-            
-            HttpRequest req = new HttpRequest();
-            req.setEndpoint(endpoint);
-            req.setMethod('GET');
-            req.setHeader('Accept', 'application/xml');
-            
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            req.setHeader('Authorization', authHeader);
-            
-            req.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse res = http.send(req);
-            
-            System.debug('ArloEventRegistrationSync: Organisation API response status: ' + res.getStatusCode());
-            
+            HttpResponse res = makeArloRequest(endpoint, username, password);
+
             if (res.getStatusCode() == 200) {
-                String responseBody = res.getBody();
-                System.debug('ArloEventRegistrationSync: Organisation response body length: ' + responseBody.length());
-                System.debug('ArloEventRegistrationSync: Organisation response body (first 500 chars): ' + (responseBody.length() > 500 ? responseBody.substring(0, 500) : responseBody));
-                
-                // Try DOM parsing first (more robust)
-                try {
-                    Dom.Document doc = new Dom.Document();
-                    doc.load(responseBody);
-                    Dom.XmlNode root = doc.getRootElement();
-                    System.debug('ArloEventRegistrationSync: DOM root element name: ' + root.getName());
-                    
-                    // Search for CodePrimary node (handle namespaces)
-                    Dom.XmlNode codePrimaryNode = findNodeByName(root, 'CodePrimary');
-                    if (codePrimaryNode != null) {
-                        String codePrimary = codePrimaryNode.getText().trim();
-                        System.debug('ArloEventRegistrationSync: Extracted CodePrimary via DOM: ' + codePrimary);
-                        return codePrimary;
-                    } else {
-                        System.debug('ArloEventRegistrationSync: CodePrimary node not found via DOM. Searching all nodes...');
-                        // Debug: List all node names
-                        List<String> nodeNames = new List<String>();
-                        collectNodeNames(root, nodeNames);
-                        System.debug('ArloEventRegistrationSync: All node names in XML: ' + String.join(nodeNames, ', '));
-                    }
-                } catch (Exception domEx) {
-                    System.debug('ArloEventRegistrationSync: DOM parsing failed, trying regex: ' + domEx.getMessage());
-                    System.debug('ArloEventRegistrationSync: DOM exception stack: ' + domEx.getStackTraceString());
-                }
-                
-                // Fallback to regex (handle namespaces and whitespace)
-                System.debug('ArloEventRegistrationSync: Trying regex pattern matching...');
-                Pattern codePrimaryPattern = Pattern.compile('(?i)<CodePrimary[^>]*>(.*?)</CodePrimary>');
-                Matcher matcher = codePrimaryPattern.matcher(responseBody);
-                if (matcher.find()) {
-                    String codePrimary = matcher.group(1).trim();
-                    System.debug('ArloEventRegistrationSync: Extracted CodePrimary via regex: ' + codePrimary);
-                    return codePrimary;
-                } else {
-                    System.debug('ArloEventRegistrationSync: No CodePrimary found in organisation response via regex');
-                    // Try alternative patterns
-                    Pattern altPattern1 = Pattern.compile('(?i)CodePrimary[^>]*>([^<]+)</');
-                    Matcher altMatcher1 = altPattern1.matcher(responseBody);
-                    if (altMatcher1.find()) {
-                        String codePrimary = altMatcher1.group(1).trim();
-                        System.debug('ArloEventRegistrationSync: Extracted CodePrimary via alternative regex: ' + codePrimary);
-                        return codePrimary;
-                    }
-                    
-                    // CodePrimary not found - log full response for debugging (truncated to 2000 chars)
-                    System.debug('ArloEventRegistrationSync: CodePrimary not found in organisation ' + organisationId + '. Full response (truncated): ' + (responseBody.length() > 2000 ? responseBody.substring(0, 2000) + '...' : responseBody));
-                    System.debug('ArloEventRegistrationSync: This may be normal - some Arlo organizations do not have a CodePrimary value.');
+                // Use ArloXmlParser to parse organisation details
+                ArloModels.ArloOrganisation org = ArloXmlParser.parseOrganisationDetails(res.getBody());
+                if (org != null && String.isNotBlank(org.codePrimary)) {
+                    return org.codePrimary;
                 }
             } else {
-                System.debug('ArloEventRegistrationSync: Error getting organisation data. Status: ' + res.getStatusCode());
-                System.debug('ArloEventRegistrationSync: Response body: ' + res.getBody());
+                System.debug('ArloEventRegistrationSync: Error getting organisation data for organisation ID ' + organisationId + '. Status: ' + res.getStatusCode());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting CodePrimary from organisation ' + organisationId + ': ' + e.getMessage());
-            System.debug('ArloEventRegistrationSync: Exception stack: ' + e.getStackTraceString());
+            System.debug('ArloEventRegistrationSync: Error getting CodePrimary for organisation ID ' + organisationId + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
-        System.debug('ArloEventRegistrationSync: Returning null for CodePrimary (organisationId: ' + organisationId + ') - This may be normal if the organization does not have a CodePrimary value in Arlo.');
         return null;
     }
     
     /**
      * Helper method to collect all node names for debugging
      */
+    @TestVisible
     private static void collectNodeNames(Dom.XmlNode node, List<String> nodeNames) {
         if (node == null) {
             return;
@@ -1850,6 +1540,7 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Helper method to find XML node by name (handles namespaces)
      */
+    @TestVisible
     private static Dom.XmlNode findNodeByName(Dom.XmlNode parent, String nodeName) {
         if (parent == null) {
             return null;
@@ -1892,27 +1583,20 @@ public with sharing class ArloEventRegistrationSync {
             
             return accounts.isEmpty() ? null : accounts[0];
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error querying Account: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error querying Account for AccountNumber ' + accountNumber + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
             return null;
         }
     }
-    
+
     /**
      * Extract the "next" link for pagination
      */
+    @TestVisible
     private static String extractNextLink(String xmlBody) {
-        try {
-            Pattern nextPattern = Pattern.compile('<Link[^>]*rel="next"[^>]*href="([^"]*)"');
-            Matcher matcher = nextPattern.matcher(xmlBody);
-            if (matcher.find()) {
-                return matcher.group(1);
-            }
-        } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error extracting next link: ' + e.getMessage());
-        }
-        return null;
+        return ArloXmlParser.extractNextLink(xmlBody);
     }
-    
+
     /**
      * Create a log record
      */
@@ -1933,11 +1617,12 @@ public with sharing class ArloEventRegistrationSync {
             insert log;
             return log.Id;
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error creating log record: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error creating log record for operation ' + operationType + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
             return null;
         }
     }
-    
+
     /**
      * Send email notification when sync fails (public for Queueable)
      */
@@ -1948,6 +1633,7 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Send email notification when sync fails
      */
+    @TestVisible
     private static void sendErrorNotification(Id logId, String errorMessage) {
         try {
             List<String> toAddresses = new List<String>{ 'patrisha@redux.nz', 'lifeeducation@redux.nz' };
@@ -1984,16 +1670,17 @@ public with sharing class ArloEventRegistrationSync {
                         }
                     }
                 } catch (Exception queryEx) {
-                    System.debug('ArloEventRegistrationSync: Error querying log record for email: ' + queryEx.getMessage());
+                    System.debug('ArloEventRegistrationSync: Error querying log record for email notification, log ID ' + logId + ': ' + queryEx.getMessage());
                 }
-                
+
                 // Get org URL for log record link
                 String orgUrl = '';
                 try {
                     // Use Site.getBaseUrl() or construct from current request
                     orgUrl = System.URL.getOrgDomainUrl().toExternalForm();
                 } catch (Exception urlEx) {
-                    // Fallback - just include the log ID
+                    // Fallback - just include the log ID (expected in some contexts)
+                    System.debug('ArloEventRegistrationSync: Could not get org URL, using placeholder: ' + urlEx.getMessage());
                     orgUrl = '[Your Salesforce Org URL]';
                 }
                 emailBody += 'Log Record ID: ' + logId + '\n';
@@ -2009,10 +1696,11 @@ public with sharing class ArloEventRegistrationSync {
             System.debug('ArloEventRegistrationSync: Error notification email sent to ' + toAddresses);
         } catch (Exception e) {
             System.debug('ArloEventRegistrationSync: Error sending notification email: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
             // Don't throw - email failure shouldn't stop the process
         }
     }
-    
+
     /**
      * Update a log record
      */
@@ -2079,7 +1767,8 @@ public with sharing class ArloEventRegistrationSync {
                                         Integer count = Integer.valueOf(parts[1].trim());
                                         failedCount += count;
                                     } catch (Exception e) {
-                                        // Ignore parsing errors
+                                        // Parsing error for failure count - skip this line (expected for non-numeric values)
+                                        System.debug(LoggingLevel.FINE, 'ArloEventRegistrationSync: Could not parse failure count from line: ' + line);
                                     }
                                 }
                             }
@@ -2114,50 +1803,26 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Map event name to campaign name
      * Checks event name for keywords and maps to corresponding campaign
+     * Delegates to EventCampaignMapper for the actual mapping
      */
+    @TestVisible
     private static String getCampaignNameForEvent(String eventName) {
-        if (String.isBlank(eventName)) {
-            return null;
+        String campaignName = EventCampaignMapper.getCampaignNameForEvent(eventName);
+        if (campaignName != null) {
+            System.debug('ArloEventRegistrationSync: Mapped event "' + eventName + '" -> ' + campaignName);
+        } else {
+            System.debug('ArloEventRegistrationSync: No campaign match for event "' + eventName + '"');
         }
-        
-        String eventNameUpper = eventName.toUpperCase();
-        System.debug('ArloEventRegistrationSync: Mapping event name "' + eventName + '" (uppercase: "' + eventNameUpper + '")');
-        
-        // Check for keywords in order of specificity (more specific first)
-        // IMPORTANT: Check ANXIETY before NEURODIVERSITY to handle cases where event name might contain both
-        if (eventNameUpper.contains('ANXIETY')) {
-            System.debug('ArloEventRegistrationSync: ✓ Matched keyword "ANXIETY" -> NHM - Anxiety');
-            // If event name contains both ANXIETY and NEURODIVERSITY, log a warning
-            if (eventNameUpper.contains('NEURODIVERSITY') || eventNameUpper.contains('NEURO-DIVERSITY')) {
-                System.debug('ArloEventRegistrationSync: ⚠️ WARNING: Event name contains BOTH "ANXIETY" and "NEURODIVERSITY" keywords. Matching ANXIETY first (correct behavior).');
-            }
-            return 'NHM - Anxiety';
-        } else if (eventNameUpper.contains('DIGITAL') && (eventNameUpper.contains('WELLBEING') || eventNameUpper.contains('WELL-BEING'))) {
-            System.debug('ArloEventRegistrationSync: ✓ Matched keywords "DIGITAL" + "WELLBEING" -> NHM - Digital wellbeing');
-            return 'NHM - Digital wellbeing';
-        } else if (eventNameUpper.contains('SELF-CARE') || eventNameUpper.contains('SELFCARE') || eventNameUpper.contains('SELF CARE')) {
-            System.debug('ArloEventRegistrationSync: ✓ Matched keyword "SELF-CARE/SELFCARE" -> NHM - Self-care');
-            return 'NHM - Self-care';
-        } else if (eventNameUpper.contains('NEURODIVERSITY') || eventNameUpper.contains('NEURO-DIVERSITY')) {
-            System.debug('ArloEventRegistrationSync: ✓ Matched keyword "NEURODIVERSITY" -> NHM - Neurodiversity');
-            return 'NHM - Neurodiversity';
-        }
-        
-        System.debug('ArloEventRegistrationSync: ✗ No keyword match found for event name "' + eventName + '"');
-        return null;
+        return campaignName;
     }
     
     /**
      * Public method to test event name mapping (for debugging)
      * Usage: ArloEventRegistrationSync.testEventNameMapping('Nurturing Healthy Minds - Neurodiversity');
+     * Delegates to SyncDiagnostics
      */
     public static String testEventNameMapping(String eventName) {
-        System.debug('=== TESTING EVENT NAME MAPPING ===');
-        System.debug('Event Name: ' + eventName);
-        String campaignName = getCampaignNameForEvent(eventName);
-        System.debug('Result: ' + (campaignName != null ? campaignName : 'NO MATCH'));
-        System.debug('=== END TEST ===\n');
-        return campaignName;
+        return SyncDiagnostics.testEventNameMapping(eventName);
     }
     
     /**
@@ -2166,267 +1831,45 @@ public with sharing class ArloEventRegistrationSync {
     public static void addContactsToCampaignsStatic(List<ContactEventWrapper> contactEventList, Map<Id, Contact> syncedContactMap) {
         System.debug('ArloEventRegistrationSync: ===== addContactsToCampaignsStatic START =====');
         System.debug('ArloEventRegistrationSync: Input - contactEventList size: ' + contactEventList.size() + ', syncedContactMap size: ' + syncedContactMap.size());
-        
-        // Create map of Arlo Contact ID/UUID to LIST of wrappers (to handle multiple registrations per contact)
-        Map<String, List<ContactEventWrapper>> arloContactIdToWrapperMap = new Map<String, List<ContactEventWrapper>>();
-        Map<String, List<ContactEventWrapper>> emailToWrapperMap = new Map<String, List<ContactEventWrapper>>();
-        
-        for (ContactEventWrapper wrapper : contactEventList) {
-            // Map by Arlo Contact ID (UUID) - normalize for matching (allow multiple wrappers per contact)
-            if (String.isNotBlank(wrapper.contact.contactId)) {
-                String uuidKey = wrapper.contact.contactId.trim();
-                if (!arloContactIdToWrapperMap.containsKey(uuidKey)) {
-                    arloContactIdToWrapperMap.put(uuidKey, new List<ContactEventWrapper>());
-                }
-                arloContactIdToWrapperMap.get(uuidKey).add(wrapper);
-                System.debug('ArloEventRegistrationSync: Mapped wrapper by UUID: ' + uuidKey + ' -> Event: ' + wrapper.eventName);
-            }
-            // Map by Email (as backup) - normalize for matching (allow multiple wrappers per contact)
-            if (String.isNotBlank(wrapper.contact.email)) {
-                String emailKey = wrapper.contact.email.toLowerCase().trim();
-                if (!emailToWrapperMap.containsKey(emailKey)) {
-                    emailToWrapperMap.put(emailKey, new List<ContactEventWrapper>());
-                }
-                emailToWrapperMap.get(emailKey).add(wrapper);
-                System.debug('ArloEventRegistrationSync: Mapped wrapper by Email: ' + emailKey + ' -> Event: ' + wrapper.eventName);
-            }
-        }
-        
-        System.debug('ArloEventRegistrationSync: Created wrapper maps - UUID map size: ' + arloContactIdToWrapperMap.size() + ', Email map size: ' + emailToWrapperMap.size());
-        
-        // Get campaign name to Campaign ID mapping
-        Map<String, Id> campaignNameToIdMap = new Map<String, Id>();
-        List<Campaign> campaigns = [
-            SELECT Id, Name
-            FROM Campaign
-            WHERE Name IN ('NHM - Anxiety', 'NHM - Digital wellbeing', 'NHM - Self-care', 'NHM - Neurodiversity')
-        ];
-        for (Campaign camp : campaigns) {
-            campaignNameToIdMap.put(camp.Name, camp.Id);
-        }
-        
-        if (campaignNameToIdMap.isEmpty()) {
-            System.debug('ArloEventRegistrationSync: No campaigns found with expected names');
-            return;
-        }
-        
-        // Map Contact ID to Set of Campaign Names (to handle multiple registrations per contact)
-        Map<Id, Set<String>> contactToCampaignsMap = new Map<Id, Set<String>>();
-        System.debug('ArloEventRegistrationSync: Processing contacts for campaign assignment');
-        System.debug('ArloEventRegistrationSync: Available wrappers - UUID map: ' + arloContactIdToWrapperMap.size() + ', Email map: ' + emailToWrapperMap.size());
-        System.debug('ArloEventRegistrationSync: Synced contacts map size: ' + syncedContactMap.size());
-        
-        // CRITICAL: Only process contacts that have wrappers in contactEventList
-        // Build a set of contact identifiers (UUID/Email) that have wrappers
-        Set<String> wrapperUuids = new Set<String>();
-        Set<String> wrapperEmails = new Set<String>();
-        for (ContactEventWrapper wrapper : contactEventList) {
-            if (wrapper.contact != null) {
-                if (String.isNotBlank(wrapper.contact.contactId)) {
-                    wrapperUuids.add(wrapper.contact.contactId.trim());
-                }
-                if (String.isNotBlank(wrapper.contact.email)) {
-                    wrapperEmails.add(wrapper.contact.email.toLowerCase().trim());
+
+        // Delegate to CampaignMemberManager for campaign member creation
+        CampaignMemberManager.AddMembersResult result = CampaignMemberManager.addContactsToCampaigns(
+            contactEventList,
+            syncedContactMap
+        );
+
+        // Log results
+        System.debug('ArloEventRegistrationSync: Campaign member operation completed:');
+        System.debug('ArloEventRegistrationSync:   - Total processed: ' + result.totalProcessed);
+        System.debug('ArloEventRegistrationSync:   - Members added: ' + result.membersAdded);
+        System.debug('ArloEventRegistrationSync:   - Already members: ' + result.alreadyMembers);
+        System.debug('ArloEventRegistrationSync:   - No campaign match: ' + result.noCampaignMatch);
+        System.debug('ArloEventRegistrationSync:   - Campaign not found: ' + result.campaignNotFound);
+
+        // Check for critical errors (DML failures) vs informational errors
+        // Throw exception only for insert failures to maintain backward compatibility
+        if (!result.errors.isEmpty()) {
+            for (String error : result.errors) {
+                System.debug('ArloEventRegistrationSync: Error: ' + error);
+                // Only throw for actual insert failures, not for informational messages
+                if (error.startsWith('Error inserting campaign members:')) {
+                    throw new CampaignMemberException(error);
                 }
             }
         }
-        System.debug('ArloEventRegistrationSync: Wrapper UUIDs: ' + wrapperUuids.size() + ', Wrapper Emails: ' + wrapperEmails.size());
-        
-        // Only process contacts in syncedContactMap that match wrappers (have registrations)
-        for (Contact contact : syncedContactMap.values()) {
-            List<ContactEventWrapper> wrappers = new List<ContactEventWrapper>();
-            
-            // Normalize contact identifiers for matching
-            String contactUuid = contact.Arlo_Contact_UUID__c != null ? contact.Arlo_Contact_UUID__c.trim() : '';
-            String contactEmail = contact.Email != null ? contact.Email.toLowerCase().trim() : '';
-            
-            // CRITICAL CHECK: Only process contacts that have wrappers (have registrations)
-            Boolean hasWrapper = false;
-            if (String.isNotBlank(contactUuid) && wrapperUuids.contains(contactUuid)) {
-                hasWrapper = true;
-            } else if (String.isNotBlank(contactEmail) && wrapperEmails.contains(contactEmail)) {
-                hasWrapper = true;
-            }
-            
-            if (!hasWrapper) {
-                // This contact doesn't have any registrations - skip it
-                System.debug('ArloEventRegistrationSync: Skipping contact ' + contact.Id + ' - no matching wrapper found (UUID: "' + contactUuid + '", Email: "' + contactEmail + '")');
-                continue;
-            }
-            
-            // Debug: Check if this is contact 644 or 1944
-            Boolean isContact644 = (contactUuid != null && contactUuid.contains('644')) || 
-                                   (contactEmail != null && contactEmail.contains('644'));
-            Boolean isContact1944 = (contactUuid != null && contactUuid.contains('9b4c8fc8-eff0-4c04-a7b3-535fe95a23ff')) || 
-                                    (contactEmail != null && contactEmail == 'kavanagha@hautapu.school.nz');
-            if (isContact644 || isContact1944) {
-                System.debug('ArloEventRegistrationSync: *** PROCESSING CONTACT ' + (isContact644 ? '644' : '1944') + ' FOR CAMPAIGN ASSIGNMENT ***');
-                System.debug('ArloEventRegistrationSync: Contact ID: ' + contact.Id);
-                System.debug('ArloEventRegistrationSync: Contact UUID: "' + contactUuid + '"');
-                System.debug('ArloEventRegistrationSync: Contact Email: "' + contactEmail + '"');
-                System.debug('ArloEventRegistrationSync: Contact has wrapper - will process');
-            }
-            
-            // Try to find wrappers by Arlo Contact UUID (preferred method) - normalize for matching
-            if (String.isNotBlank(contactUuid)) {
-                List<ContactEventWrapper> uuidWrappers = arloContactIdToWrapperMap.get(contactUuid);
-                if (uuidWrappers != null && !uuidWrappers.isEmpty()) {
-                    wrappers.addAll(uuidWrappers);
-                    System.debug('ArloEventRegistrationSync: ✓ Found ' + uuidWrappers.size() + ' wrapper(s) for contact ' + contact.Id + ' by UUID: "' + contactUuid + '"');
-                    if (isContact644 || isContact1944) {
-                        for (ContactEventWrapper w : uuidWrappers) {
-                            System.debug('ArloEventRegistrationSync:   - Event: ' + w.eventName + ' -> Campaign: ' + getCampaignNameForEvent(w.eventName));
-                        }
-                    }
-                }
-            }
-            
-            // Try to find wrappers by Email (fallback method) - normalize for matching
-            if (String.isNotBlank(contactEmail)) {
-                List<ContactEventWrapper> emailWrappers = emailToWrapperMap.get(contactEmail);
-                if (emailWrappers != null && !emailWrappers.isEmpty()) {
-                    // Add wrappers that aren't already in the list (avoid duplicates)
-                    for (ContactEventWrapper w : emailWrappers) {
-                        Boolean alreadyAdded = false;
-                        for (ContactEventWrapper existing : wrappers) {
-                            if (existing.eventName == w.eventName && existing.eventCode == w.eventCode) {
-                                alreadyAdded = true;
-                                break;
-                            }
-                        }
-                        if (!alreadyAdded) {
-                            wrappers.add(w);
-                        }
-                    }
-                    System.debug('ArloEventRegistrationSync: ✓ Found ' + emailWrappers.size() + ' wrapper(s) for contact ' + contact.Id + ' by Email: "' + contactEmail + '"');
-                }
-            }
-            
-            // Last resort: try direct iteration matching (in case of whitespace/case issues)
-            if (wrappers.isEmpty()) {
-                for (ContactEventWrapper w : contactEventList) {
-                    String wrapperUuid = w.contact.contactId != null ? w.contact.contactId.trim() : '';
-                    String wrapperEmail = w.contact.email != null ? w.contact.email.toLowerCase().trim() : '';
-                    
-                    if ((String.isNotBlank(contactUuid) && contactUuid == wrapperUuid) ||
-                        (String.isNotBlank(contactEmail) && contactEmail == wrapperEmail)) {
-                        wrappers.add(w);
-                        System.debug('ArloEventRegistrationSync: ✓ Found wrapper for contact ' + contact.Id + ' via direct iteration');
-                    }
-                }
-            }
-            
-            if (wrappers.isEmpty()) {
-                System.debug('ArloEventRegistrationSync: WARNING - No wrappers found for contact ' + contact.Id + ' (UUID: "' + contactUuid + '", Email: "' + contactEmail + '")');
-                System.debug('ArloEventRegistrationSync:   This means the contact was found in Salesforce but no matching wrapper was found in contactEventList');
-                System.debug('ArloEventRegistrationSync:   Total wrappers in list: ' + contactEventList.size());
-                System.debug('ArloEventRegistrationSync:   UUID map size: ' + arloContactIdToWrapperMap.size() + ', Email map size: ' + emailToWrapperMap.size());
-                
-                // Debug: Show first few wrappers for comparison
-                Integer debugCount = 0;
-                for (ContactEventWrapper w : contactEventList) {
-                    if (debugCount < 3) {
-                        System.debug('ArloEventRegistrationSync:     Sample wrapper - UUID: "' + (w.contact != null && w.contact.contactId != null ? w.contact.contactId.trim() : 'null') + 
-                                   '", Email: "' + (w.contact != null && w.contact.email != null ? w.contact.email.toLowerCase().trim() : 'null') + 
-                                   '", Event: ' + w.eventName);
-                        debugCount++;
-                    }
-                }
-                continue;
-            }
-            
-            // Process ALL wrappers for this contact (to handle multiple registrations)
-            Set<String> campaignNames = new Set<String>();
-            for (ContactEventWrapper wrapper : wrappers) {
-                if (String.isBlank(wrapper.eventName)) {
-                    System.debug('ArloEventRegistrationSync: WARNING - Wrapper found for contact ' + contact.Id + ' but eventName is blank');
-                    continue;
-                }
-                
-                String campaignName = getCampaignNameForEvent(wrapper.eventName);
-                if (String.isBlank(campaignName)) {
-                    System.debug('ArloEventRegistrationSync: No campaign match for event "' + wrapper.eventName + '" for contact ' + contact.Id + ' (event name does not contain recognized keywords)');
-                    continue;
-                }
-                
-                if (!campaignNameToIdMap.containsKey(campaignName)) {
-                    System.debug('ArloEventRegistrationSync: Campaign "' + campaignName + '" not found in Salesforce for contact ' + contact.Id);
-                    continue;
-                }
-                
-                campaignNames.add(campaignName);
-                System.debug('ArloEventRegistrationSync: ✓ Matched contact ' + contact.Id + ' to event "' + wrapper.eventName + '" -> campaign "' + campaignName + '"');
-                
-                if (isContact644 || isContact1944) {
-                    System.debug('ArloEventRegistrationSync: *** CONTACT ' + (isContact644 ? '644' : '1944') + ' - Event: ' + wrapper.eventName + ' -> Campaign: ' + campaignName + ' ***');
-                }
-            }
-            
-            if (!campaignNames.isEmpty()) {
-                contactToCampaignsMap.put(contact.Id, campaignNames);
-                System.debug('ArloEventRegistrationSync: Contact ' + contact.Id + ' will be added to ' + campaignNames.size() + ' campaign(s): ' + String.join(new List<String>(campaignNames), ', '));
-            }
-        }
-        
-        if (contactToCampaignsMap.isEmpty()) {
-            System.debug('ArloEventRegistrationSync: No contacts matched to campaigns');
-            return;
-        }
-        
-        // Get existing campaign members to avoid duplicates
-        Set<Id> contactIds = contactToCampaignsMap.keySet();
-        Set<Id> campaignIds = new Set<Id>(campaignNameToIdMap.values());
-        List<CampaignMember> existingMembers = [
-            SELECT ContactId, CampaignId
-            FROM CampaignMember
-            WHERE ContactId IN :contactIds AND CampaignId IN :campaignIds
-        ];
-        
-        Set<String> existingMemberKeys = new Set<String>();
-        for (CampaignMember member : existingMembers) {
-            existingMemberKeys.add(member.ContactId + '_' + member.CampaignId);
-        }
-        
-        // Create new campaign members (one per campaign per contact)
-        List<CampaignMember> membersToInsert = new List<CampaignMember>();
-        for (Id contactId : contactToCampaignsMap.keySet()) {
-            Set<String> campaignNames = contactToCampaignsMap.get(contactId);
-            for (String campaignName : campaignNames) {
-                Id campaignId = campaignNameToIdMap.get(campaignName);
-                String memberKey = contactId + '_' + campaignId;
-                
-                if (!existingMemberKeys.contains(memberKey)) {
-                    membersToInsert.add(new CampaignMember(
-                        ContactId = contactId,
-                        CampaignId = campaignId,
-                        Status = 'Responded'
-                    ));
-                    System.debug('ArloEventRegistrationSync: Preparing to add contact ' + contactId + ' to campaign "' + campaignName + '"');
-                } else {
-                    System.debug('ArloEventRegistrationSync: Contact ' + contactId + ' already a member of campaign "' + campaignName + '" - skipping');
-                }
-            }
-        }
-        
-        if (!membersToInsert.isEmpty()) {
-            try {
-                insert membersToInsert;
-                System.debug('ArloEventRegistrationSync: Successfully added ' + membersToInsert.size() + ' contacts to campaigns');
-            } catch (Exception e) {
-                System.debug('ArloEventRegistrationSync: Error inserting campaign members: ' + e.getMessage());
-                System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
-                throw e;
-            }
-        } else {
-            System.debug('ArloEventRegistrationSync: All contacts are already campaign members - no new campaign members to insert');
-        }
-        
+
         System.debug('ArloEventRegistrationSync: ===== addContactsToCampaignsStatic END =====');
     }
+
+    /**
+     * Exception class for campaign member operations
+     */
+    public class CampaignMemberException extends Exception {}
     
     /**
      * Get Salesforce Account by AccountNumber (uses existing method)
      */
+    @TestVisible
     private static Account getSalesforceAccountByNumber(String accountNumber) {
         return getSalesforceAccountByNumberStatic(accountNumber);
     }
@@ -2434,9 +1877,9 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Helper method to get contact IDs from ArloContact list
      */
-    public static Set<String> getContactIds(List<ArloContactSync.ArloContact> contacts) {
+    public static Set<String> getContactIds(List<ArloModels.ArloContact> contacts) {
         Set<String> ids = new Set<String>();
-        for (ArloContactSync.ArloContact contact : contacts) {
+        for (ArloModels.ArloContact contact : contacts) {
             if (String.isNotBlank(contact.contactId)) {
                 ids.add(contact.contactId);
             }
@@ -2447,9 +1890,9 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Helper method to get contact emails from ArloContact list
      */
-    public static Set<String> getContactEmails(List<ArloContactSync.ArloContact> contacts) {
+    public static Set<String> getContactEmails(List<ArloModels.ArloContact> contacts) {
         Set<String> emails = new Set<String>();
-        for (ArloContactSync.ArloContact contact : contacts) {
+        for (ArloModels.ArloContact contact : contacts) {
             if (String.isNotBlank(contact.email)) {
                 emails.add(contact.email);
             }
@@ -2465,114 +1908,51 @@ public with sharing class ArloEventRegistrationSync {
         public String code;
         public String name;
     }
-    
+
     /**
      * Inner class to wrap contact with event information
      */
     public class ContactEventWrapper {
-        public ArloContactSync.ArloContact contact;
+        public ArloModels.ArloContact contact;
         public String eventName;
         public String eventCode;
+    }
+
+    /**
+     * Inner class to hold reverse lookup maps for contact matching
+     */
+    public class ReverseMapsResult {
+        public Map<String, String> uuidToNumericId;
+        public Map<String, String> emailToNumericId;
+
+        public ReverseMapsResult() {
+            this.uuidToNumericId = new Map<String, String>();
+            this.emailToNumericId = new Map<String, String>();
+        }
+    }
+
+    /**
+     * Inner class to wrap registration processing result
+     */
+    public class RegistrationProcessingResult {
+        public EventData eventData;
+        public Integer calloutCount;
+        public Boolean shouldProcess;
+
+        public RegistrationProcessingResult(Integer calloutCount) {
+            this.calloutCount = calloutCount;
+            this.shouldProcess = false;
+            this.eventData = null;
+        }
     }
     
     /**
      * Debug method to check the registrations endpoint response for a contact
      * Usage: ArloEventRegistrationSync.debugContactRegistrationsEndpoint('1944');
+     * Delegates to SyncDiagnostics
      */
     public static void debugContactRegistrationsEndpoint(String numericContactId) {
-        System.debug('=== DEBUGGING CONTACT REGISTRATIONS ENDPOINT ===');
-        System.debug('Contact Numeric ID: ' + numericContactId);
-        
-        // Load credentials
-        try {
-            loadCredentialsFromCustomSettings();
-        } catch (Exception e) {
-            System.debug('❌ ERROR: Could not load credentials: ' + e.getMessage());
-            return;
-        }
-        
-        try {
-            String registrationsEndpoint = ARLO_API_BASE_URL + '/resources/contacts/' + numericContactId + '/registrations/';
-            System.debug('Endpoint: ' + registrationsEndpoint);
-            
-            HttpRequest req = new HttpRequest();
-            req.setEndpoint(registrationsEndpoint);
-            req.setMethod('GET');
-            req.setHeader('Accept', 'application/xml');
-            
-            Blob authBlob = Blob.valueOf(arloUsername + ':' + arloPassword);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            req.setHeader('Authorization', authHeader);
-            req.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse res = http.send(req);
-            
-            System.debug('\n=== RESPONSE DETAILS ===');
-            System.debug('Status Code: ' + res.getStatusCode());
-            System.debug('Status: ' + res.getStatus());
-            
-            String responseBody = res.getBody();
-            System.debug('Response Body Length: ' + responseBody.length());
-            System.debug('\n=== FULL RESPONSE BODY ===');
-            System.debug(responseBody);
-            
-            if (res.getStatusCode() == 200) {
-                System.debug('\n=== PARSING RESPONSE ===');
-                
-                // Try to extract registration links
-                Pattern regLinkPattern = Pattern.compile('<Link[^>]*href="([^"]*registrations/[^"]+)"');
-                Matcher regMatcher = regLinkPattern.matcher(responseBody);
-                
-                List<String> registrationLinks = new List<String>();
-                while (regMatcher.find()) {
-                    registrationLinks.add(regMatcher.group(1));
-                }
-                
-                System.debug('Found ' + registrationLinks.size() + ' registration link(s):');
-                for (String link : registrationLinks) {
-                    System.debug('  - ' + link);
-                }
-                
-                // Try to extract registration IDs
-                Pattern regIdPattern = Pattern.compile('/registrations/(\\d+)/');
-                Set<String> registrationIds = new Set<String>();
-                for (String link : registrationLinks) {
-                    Matcher idMatcher = regIdPattern.matcher(link);
-                    if (idMatcher.find()) {
-                        registrationIds.add(idMatcher.group(1));
-                    }
-                }
-                
-                System.debug('\nExtracted Registration IDs: ' + registrationIds.size());
-                for (String regId : registrationIds) {
-                    System.debug('  - Registration ID: ' + regId);
-                }
-                
-                // Try to extract event links
-                Pattern eventLinkPattern = Pattern.compile('<Link[^>]*rel="[^"]*Event"[^>]*href="([^"]*events/[^"]+)"');
-                Matcher eventMatcher = eventLinkPattern.matcher(responseBody);
-                
-                List<String> eventLinks = new List<String>();
-                while (eventMatcher.find()) {
-                    eventLinks.add(eventMatcher.group(1));
-                }
-                
-                System.debug('\nFound ' + eventLinks.size() + ' event link(s):');
-                for (String link : eventLinks) {
-                    System.debug('  - ' + link);
-                }
-                
-            } else {
-                System.debug('❌ Request failed with status: ' + res.getStatusCode());
-            }
-            
-        } catch (Exception e) {
-            System.debug('❌ ERROR: ' + e.getMessage());
-            System.debug('Stack Trace: ' + e.getStackTraceString());
-        }
-        
-        System.debug('\n=== END DEBUG ===\n');
+        SyncDiagnostics.debugContactRegistrationsEndpoint(numericContactId);
     }
     
     /**
@@ -2612,7 +1992,7 @@ public with sharing class ArloEventRegistrationSync {
             // Still need to find contact in Salesforce to check campaign memberships
             // Get contact details from Arlo first to find email/UUID
             try {
-                ArloContactSync.ArloContact arloContact = ArloContactSync.getSingleArloContactStatic(arloNumericContactId, arloUsername, arloPassword);
+                ArloModels.ArloContact arloContact = ArloContactSync.getSingleArloContactStatic(arloNumericContactId, arloUsername, arloPassword);
                 if (arloContact != null && (String.isNotBlank(arloContact.email) || String.isNotBlank(arloContact.contactId))) {
                     // Find contact in Salesforce
                     List<Contact> contacts = [
@@ -2721,23 +2101,10 @@ public with sharing class ArloEventRegistrationSync {
         
         if (String.isNotBlank(arloNumericContactId)) {
             // Get registrations directly from contact endpoint
-            System.debug('Getting registrations for contact ID: ' + arloNumericContactId);
             try {
                 String registrationsEndpoint = ARLO_API_BASE_URL + '/resources/contacts/' + arloNumericContactId + '/registrations/';
-                
-                HttpRequest req = new HttpRequest();
-                req.setEndpoint(registrationsEndpoint);
-                req.setMethod('GET');
-                req.setHeader('Accept', 'application/xml');
-                
-                Blob authBlob = Blob.valueOf(arloUsername + ':' + arloPassword);
-                String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-                req.setHeader('Authorization', authHeader);
-                req.setTimeout(30000);
-                
-                Http http = new Http();
-                HttpResponse res = http.send(req);
-                
+                HttpResponse res = makeArloRequest(registrationsEndpoint, arloUsername, arloPassword);
+
                 if (res.getStatusCode() == 200) {
                     String responseBody = res.getBody();
                     System.debug('✓ Successfully retrieved registrations from Arlo');
@@ -2745,42 +2112,8 @@ public with sharing class ArloEventRegistrationSync {
                     // Parse registration links from the response
                     // Look for Link elements with rel="self" that point to registrations (these are the actual registration resources)
                     // Also look for Resource elements with type="Registration"
-                    Set<String> registrationIds = new Set<String>();
-                    
-                    // Method 1: Look for Resource elements with type="Registration"
-                    Pattern resourcePattern = Pattern.compile('<Resource[^>]*type="[^"]*Registration[^"]*"[^>]*>\\s*<Link[^>]*rel="self"[^>]*href="[^"]*/registrations/(\\d+)/"');
-                    Matcher resourceMatcher = resourcePattern.matcher(responseBody);
-                    while (resourceMatcher.find()) {
-                        String regId = resourceMatcher.group(1);
-                        registrationIds.add(regId);
-                        System.debug('Found registration ID from Resource element: ' + regId);
-                    }
-                    
-                    // Method 2: If no resources found, look for direct registration links (but be more specific)
-                    // Only match links that are direct children of registration resources or are self-referential
-                    if (registrationIds.isEmpty()) {
-                        // Look for links with rel="self" that point to registrations
-                        Pattern selfLinkPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/registrations/(\\d+)/"');
-                        Matcher selfMatcher = selfLinkPattern.matcher(responseBody);
-                        while (selfMatcher.find()) {
-                            String regId = selfMatcher.group(1);
-                            registrationIds.add(regId);
-                            System.debug('Found registration ID from self link: ' + regId);
-                        }
-                    }
-                    
-                    // Method 3: Fallback - look for any registration link but log it for debugging
-                    if (registrationIds.isEmpty()) {
-                        Pattern fallbackPattern = Pattern.compile('<Link[^>]*href="[^"]*/registrations/(\\d+)/"');
-                        Matcher fallbackMatcher = fallbackPattern.matcher(responseBody);
-                        Set<String> allMatches = new Set<String>();
-                        while (fallbackMatcher.find()) {
-                            allMatches.add(fallbackMatcher.group(1));
-                        }
-                        System.debug('Fallback: Found ' + allMatches.size() + ' potential registration IDs: ' + String.join(new List<String>(allMatches), ', '));
-                        registrationIds = allMatches;
-                    }
-                    
+                    // Extract registration IDs using ArloXmlParser
+                    Set<String> registrationIds = ArloXmlParser.extractResourceIds(responseBody, 'registrations');
                     System.debug('Total unique registration IDs found: ' + registrationIds.size());
                     if (registrationIds.size() > 10) {
                         System.debug('⚠️  WARNING: Found ' + registrationIds.size() + ' registrations, which seems high. This might include pagination or related resource links.');
@@ -3009,7 +2342,7 @@ public with sharing class ArloEventRegistrationSync {
             } else {
                 // For numeric ID, try to find contact by getting Arlo contact details first
                 try {
-                    ArloContactSync.ArloContact arloContact = ArloContactSync.getSingleArloContactStatic(arloNumericContactId, arloUsername, arloPassword);
+                    ArloModels.ArloContact arloContact = ArloContactSync.getSingleArloContactStatic(arloNumericContactId, arloUsername, arloPassword);
                     if (arloContact != null && (String.isNotBlank(arloContact.email) || String.isNotBlank(arloContact.contactId))) {
                         List<Contact> contacts = [
                             SELECT Id, FirstName, LastName, Email, Arlo_Contact_UUID__c
@@ -3124,12 +2457,13 @@ public with sharing class ArloEventRegistrationSync {
      * Add contact to campaign by UUID/Email and event name (no API calls)
      * This is a simple wrapper that finds the contact and adds it to the campaign
      * Usage: ArloEventRegistrationSync.addContactToCampaignByEvent('9b4c8fc8-eff0-4c04-a7b3-535fe95a23ff', 'Nurturing Healthy Minds - Neurodiversity');
+     * Delegates to CampaignMemberManager
      */
     public static Boolean addContactToCampaignByEvent(String contactUuidOrEmail, String eventName) {
         System.debug('=== ADDING CONTACT TO CAMPAIGN (NO API CALLS) ===');
         System.debug('Contact Identifier: ' + contactUuidOrEmail);
         System.debug('Event Name: ' + eventName);
-        
+
         // Find contact
         List<Contact> contacts = [
             SELECT Id, FirstName, LastName, Email, Arlo_Contact_UUID__c
@@ -3137,25 +2471,28 @@ public with sharing class ArloEventRegistrationSync {
             WHERE Arlo_Contact_UUID__c = :contactUuidOrEmail OR Email = :contactUuidOrEmail
             LIMIT 1
         ];
-        
+
         if (contacts.isEmpty()) {
-            System.debug('❌ Contact not found');
+            System.debug('Contact not found');
             return false;
         }
-        
+
         Contact c = contacts[0];
-        System.debug('✓ Contact found: ' + c.FirstName + ' ' + c.LastName + ' (ID: ' + c.Id + ')');
-        
-        // Use the existing manual method
-        return manuallyAddContactToCampaign(c.Id, eventName);
+        System.debug('Contact found: ' + c.FirstName + ' ' + c.LastName + ' (ID: ' + c.Id + ')');
+
+        // Delegate to CampaignMemberManager
+        Boolean result = CampaignMemberManager.addContactToCampaignByEvent(c.Id, eventName);
+        System.debug('=== END ===');
+        return result;
     }
-    
+
     /**
      * Manually add a contact to a campaign based on event name
      * Use this when a contact has email consent in Arlo but wasn't automatically added to a campaign
      * Usage in Developer Console:
      * ArloEventRegistrationSync.manuallyAddContactToCampaign('003XXXXXXXXXXXXXXX', 'Nurturing Healthy Minds - Anxiety');
-     * 
+     * Delegates to CampaignMemberManager
+     *
      * @param contactId Salesforce Contact ID
      * @param eventName Event name (e.g., 'Nurturing Healthy Minds - Anxiety')
      * @return true if successfully added, false otherwise
@@ -3164,184 +2501,31 @@ public with sharing class ArloEventRegistrationSync {
         System.debug('=== MANUAL CAMPAIGN ASSIGNMENT ===');
         System.debug('Contact ID: ' + contactId);
         System.debug('Event Name: ' + eventName);
-        
-        try {
-            // Verify contact exists
-            List<Contact> contacts = [
-                SELECT Id, FirstName, LastName, Email, Arlo_Contact_UUID__c
-                FROM Contact
-                WHERE Id = :contactId
-                LIMIT 1
-            ];
-            
-            if (contacts.isEmpty()) {
-                System.debug('❌ ERROR: Contact not found with ID: ' + contactId);
-                return false;
-            }
-            
-            Contact contact = contacts[0];
-            System.debug('✓ Contact found: ' + contact.FirstName + ' ' + contact.LastName);
-            
-            // Get campaign name from event name
-            String campaignName = getCampaignNameForEvent(eventName);
-            if (String.isBlank(campaignName)) {
-                System.debug('❌ ERROR: Event name "' + eventName + '" does not match any campaign keywords');
-                System.debug('   Supported keywords: Anxiety, Digital wellbeing, Self-care, Neurodiversity');
-                return false;
-            }
-            
-            System.debug('✓ Campaign name: ' + campaignName);
-            
-            // Find campaign
-            List<Campaign> campaigns = [
-                SELECT Id, Name
-                FROM Campaign
-                WHERE Name = :campaignName
-                LIMIT 1
-            ];
-            
-            if (campaigns.isEmpty()) {
-                System.debug('❌ ERROR: Campaign "' + campaignName + '" not found in Salesforce');
-                return false;
-            }
-            
-            Campaign campaign = campaigns[0];
-            System.debug('✓ Campaign found: ' + campaign.Name + ' (ID: ' + campaign.Id + ')');
-            
-            // Check if already a member
-            List<CampaignMember> existingMembers = [
-                SELECT Id
-                FROM CampaignMember
-                WHERE ContactId = :contactId AND CampaignId = :campaign.Id
-                LIMIT 1
-            ];
-            
-            if (!existingMembers.isEmpty()) {
-                System.debug('⚠️  Contact is already a member of campaign "' + campaignName + '"');
-                return true;
-            }
-            
-            // Add to campaign
-            CampaignMember member = new CampaignMember(
-                ContactId = contactId,
-                CampaignId = campaign.Id,
-                Status = 'Responded'
-            );
-            
-            insert member;
-            System.debug('✓ Successfully added contact to campaign "' + campaignName + '"');
-            System.debug('=== END MANUAL ASSIGNMENT ===\n');
-            return true;
-            
-        } catch (Exception e) {
-            System.debug('❌ ERROR: ' + e.getMessage());
-            System.debug('Stack trace: ' + e.getStackTraceString());
-            System.debug('=== END MANUAL ASSIGNMENT ===\n');
-            return false;
+
+        // Delegate to CampaignMemberManager
+        Boolean result = CampaignMemberManager.addContactToCampaignByEvent(contactId, eventName);
+
+        if (result) {
+            String campaignName = EventCampaignMapper.getCampaignNameForEvent(eventName);
+            System.debug('Successfully added contact to campaign "' + campaignName + '"');
+        } else {
+            System.debug('Failed to add contact to campaign');
         }
+
+        System.debug('=== END MANUAL ASSIGNMENT ===');
+        return result;
     }
     
     /**
      * Diagnostic method to check why a contact isn't being added to a campaign
      * Usage in Developer Console:
      * ArloEventRegistrationSync.diagnoseContactCampaignAssignment('contactIdOrEmail');
-     * 
+     * Delegates to SyncDiagnostics
+     *
      * @param contactIdentifier Contact ID, Email, or Arlo Contact UUID
      */
     public static void diagnoseContactCampaignAssignment(String contactIdentifier) {
-        System.debug('=== DIAGNOSTIC: Contact Campaign Assignment ===');
-        System.debug('Contact Identifier: ' + contactIdentifier);
-        
-        // Find the contact
-        Contact contact = null;
-        try {
-            List<Contact> contacts = [
-                SELECT Id, FirstName, LastName, Email, Arlo_Contact_UUID__c, AccountId, Account.Name
-                FROM Contact
-                WHERE Id = :contactIdentifier
-                   OR Email = :contactIdentifier
-                   OR Arlo_Contact_UUID__c = :contactIdentifier
-                LIMIT 1
-            ];
-            
-            if (contacts.isEmpty()) {
-                System.debug('❌ ERROR: Contact not found with identifier: ' + contactIdentifier);
-                return;
-            }
-            
-            contact = contacts[0];
-            System.debug('✓ Contact found: ' + contact.Id);
-            System.debug('  - Name: ' + contact.FirstName + ' ' + contact.LastName);
-            System.debug('  - Email: ' + contact.Email);
-            System.debug('  - Arlo UUID: ' + contact.Arlo_Contact_UUID__c);
-            System.debug('  - Account: ' + (contact.Account != null ? contact.Account.Name : 'None'));
-        } catch (Exception e) {
-            System.debug('❌ ERROR querying contact: ' + e.getMessage());
-            return;
-        }
-        
-        // Check if contact is in any NHM campaigns
-        System.debug('\n=== Checking Campaign Memberships ===');
-        List<CampaignMember> memberships = [
-            SELECT Id, CampaignId, Campaign.Name, Status
-            FROM CampaignMember
-            WHERE ContactId = :contact.Id
-              AND Campaign.Name LIKE 'NHM - %'
-        ];
-        
-        if (memberships.isEmpty()) {
-            System.debug('❌ Contact is NOT a member of any NHM campaigns');
-        } else {
-            System.debug('✓ Contact is a member of ' + memberships.size() + ' NHM campaign(s):');
-            for (CampaignMember cm : memberships) {
-                System.debug('  - ' + cm.Campaign.Name + ' (Status: ' + cm.Status + ')');
-            }
-        }
-        
-        // Check if campaigns exist
-        System.debug('\n=== Checking Available Campaigns ===');
-        List<Campaign> campaigns = [
-            SELECT Id, Name
-            FROM Campaign
-            WHERE Name IN ('NHM - Anxiety', 'NHM - Digital wellbeing', 'NHM - Self-care', 'NHM - Neurodiversity')
-        ];
-        
-        if (campaigns.isEmpty()) {
-            System.debug('❌ ERROR: No NHM campaigns found in Salesforce!');
-        } else {
-            System.debug('✓ Found ' + campaigns.size() + ' NHM campaign(s):');
-            for (Campaign camp : campaigns) {
-                System.debug('  - ' + camp.Name + ' (ID: ' + camp.Id + ')');
-            }
-        }
-        
-        // Check if contact has Arlo UUID or Email for matching
-        System.debug('\n=== Contact Matching Info ===');
-        if (String.isBlank(contact.Arlo_Contact_UUID__c)) {
-            System.debug('⚠️  WARNING: Contact does not have Arlo_Contact_UUID__c set - may not match event registrations');
-        } else {
-            System.debug('✓ Contact has Arlo UUID: ' + contact.Arlo_Contact_UUID__c);
-        }
-        
-        if (String.isBlank(contact.Email)) {
-            System.debug('⚠️  WARNING: Contact does not have Email set - may not match event registrations');
-        } else {
-            System.debug('✓ Contact has Email: ' + contact.Email);
-        }
-        
-        System.debug('\n=== Recommendations ===');
-        if (String.isBlank(contact.Arlo_Contact_UUID__c) && String.isBlank(contact.Email)) {
-            System.debug('❌ Contact cannot be matched to event registrations - missing both UUID and Email');
-        } else if (memberships.isEmpty() && !campaigns.isEmpty()) {
-            System.debug('💡 Contact should be added to a campaign but isn\'t. Possible reasons:');
-            System.debug('   1. Contact was not registered at an NHM event');
-            System.debug('   2. Registration did not have email consent (imhappytobeemailedaboutlifeeducationtrustnews = true)');
-            System.debug('   3. Event name did not match keywords (Anxiety, Digital wellbeing, Self-care, Neurodiversity)');
-            System.debug('   4. Contact was synced before event registration sync ran');
-            System.debug('   5. Matching failed (UUID/Email mismatch between contact and registration)');
-        }
-        
-        System.debug('=== END DIAGNOSTIC ===\n');
+        SyncDiagnostics.diagnoseContactCampaignAssignment(contactIdentifier);
     }
     
     /**
@@ -3603,7 +2787,7 @@ public with sharing class ArloEventRegistrationSync {
                         
                         // Get contact details
                         calloutCount++;
-                        ArloContactSync.ArloContact contact = ArloContactSync.getSingleArloContactStatic(contactId, arloUsername, arloPassword);
+                        ArloModels.ArloContact contact = ArloContactSync.getSingleArloContactStatic(contactId, arloUsername, arloPassword);
                         if (contact == null) {
                             continue;
                         }
@@ -3670,9 +2854,10 @@ public with sharing class ArloEventRegistrationSync {
                         }
                         
                     } catch (Exception e) {
-                        System.debug('Error processing registration: ' + e.getMessage());
+                        System.debug('ArloEventRegistrationSync: Error processing registration in syncSingleContact: ' + e.getMessage());
+                        System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
                     }
-                    
+
                     // If we found the registration, break out of registration loop
                     if (!contactEventList.isEmpty()) {
                         break;
@@ -3685,9 +2870,10 @@ public with sharing class ArloEventRegistrationSync {
                 }
                 
             } catch (Exception e) {
-                System.debug('Error processing event: ' + e.getMessage());
+                System.debug('ArloEventRegistrationSync: Error processing event in syncSingleContact: ' + e.getMessage());
+                System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
             }
-            
+
             // If we found the registration, break out of event loop
             if (!contactEventList.isEmpty()) {
                 break;
@@ -3714,14 +2900,14 @@ public with sharing class ArloEventRegistrationSync {
         System.debug('\n=== Syncing contact and adding to campaigns ===');
         
         // Group by Account
-        Map<Id, List<ArloContactSync.ArloContact>> contactsByAccount = new Map<Id, List<ArloContactSync.ArloContact>>();
-        Map<ArloContactSync.ArloContact, ContactEventWrapper> contactToWrapperMap = new Map<ArloContactSync.ArloContact, ContactEventWrapper>();
+        Map<Id, List<ArloModels.ArloContact>> contactsByAccount = new Map<Id, List<ArloModels.ArloContact>>();
+        Map<ArloModels.ArloContact, ContactEventWrapper> contactToWrapperMap = new Map<ArloModels.ArloContact, ContactEventWrapper>();
         
         for (ContactEventWrapper wrapper : contactEventList) {
             Account acc = getSalesforceAccountByNumber(wrapper.contact.organisationCodePrimary);
             if (acc != null) {
                 if (!contactsByAccount.containsKey(acc.Id)) {
-                    contactsByAccount.put(acc.Id, new List<ArloContactSync.ArloContact>());
+                    contactsByAccount.put(acc.Id, new List<ArloModels.ArloContact>());
                 }
                 contactsByAccount.get(acc.Id).add(wrapper.contact);
                 contactToWrapperMap.put(wrapper.contact, wrapper);
@@ -3731,7 +2917,7 @@ public with sharing class ArloEventRegistrationSync {
         // Sync contacts
         Map<Id, Contact> syncedContactMap = new Map<Id, Contact>();
         for (Id accountId : contactsByAccount.keySet()) {
-            List<ArloContactSync.ArloContact> arloContacts = contactsByAccount.get(accountId);
+            List<ArloModels.ArloContact> arloContacts = contactsByAccount.get(accountId);
             ArloContactSync.syncContactsToSalesforceStatic(arloContacts, accountId);
             
             // Query for synced contacts
@@ -3762,6 +2948,7 @@ public with sharing class ArloEventRegistrationSync {
      * Fallback method: Process existing Salesforce contacts by directly querying their registrations
      * This ensures contacts like 1944 that weren't found through events are still processed
      */
+    @TestVisible
     private static void processExistingContactsDirectly(String username, String password, Map<Id, Contact> alreadyProcessedContacts) {
         System.debug('ArloEventRegistrationSync: Processing existing contacts directly via registrations endpoint');
         
@@ -3800,140 +2987,48 @@ public with sharing class ArloEventRegistrationSync {
                     try {
                         // Search for contact by UUID
                         String searchEndpoint = ARLO_API_BASE_URL + '/resources/contacts/?UniqueIdentifier=' + EncodingUtil.urlEncode(contact.Arlo_Contact_UUID__c, 'UTF-8');
-                        HttpRequest searchReq = new HttpRequest();
-                        searchReq.setEndpoint(searchEndpoint);
-                        searchReq.setMethod('GET');
-                        searchReq.setHeader('Accept', 'application/xml');
-                        Blob authBlob = Blob.valueOf(username + ':' + password);
-                        String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-                        searchReq.setHeader('Authorization', authHeader);
-                        searchReq.setTimeout(30000);
-                        
-                        Http http = new Http();
-                        HttpResponse searchRes = http.send(searchReq);
-                        
+                        HttpResponse searchRes = makeArloRequest(searchEndpoint, username, password);
+
                         if (searchRes.getStatusCode() == 200) {
-                            String responseBody = searchRes.getBody();
-                            // Extract numeric contact ID from response - look for Resource with type="Contact"
-                            // First try to find Resource element with type="Contact"
-                            Pattern resourcePattern = Pattern.compile('<Resource[^>]*type="[^"]*Contact[^"]*"[^>]*>');
-                            Matcher resourceMatcher = resourcePattern.matcher(responseBody);
-                            if (resourceMatcher.find()) {
-                                // Found Resource, now look for the self link after it
-                                Integer startPos = resourceMatcher.end();
-                                String remaining = responseBody.substring(startPos);
-                                Pattern linkPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                                Matcher linkMatcher = linkPattern.matcher(remaining);
-                                if (linkMatcher.find()) {
-                                    numericContactId = linkMatcher.group(1);
-                                }
-                            }
-                            
-                            // Fallback: look for any link to contacts
-                            if (String.isBlank(numericContactId)) {
-                                Pattern contactIdPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                                Matcher matcher = contactIdPattern.matcher(responseBody);
-                                if (matcher.find()) {
-                                    numericContactId = matcher.group(1);
-                                }
-                            }
+                            // Extract numeric contact ID from response using ArloXmlParser
+                            numericContactId = ArloXmlParser.extractFirstContactIdFromSearch(searchRes.getBody());
                         }
                     } catch (Exception e) {
-                        System.debug('ArloEventRegistrationSync: Error searching for contact by UUID: ' + e.getMessage());
+                        System.debug('ArloEventRegistrationSync: Error searching for contact by UUID ' + contact.Arlo_Contact_UUID__c + ': ' + e.getMessage());
+                        System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
                     }
                 }
-                
+
                 // If we still don't have numeric ID, try email
                 if (String.isBlank(numericContactId) && String.isNotBlank(contact.Email)) {
                     calloutCount++;
                     try {
                         String searchEndpoint = ARLO_API_BASE_URL + '/resources/contacts/?Email=' + EncodingUtil.urlEncode(contact.Email, 'UTF-8');
-                        HttpRequest searchReq = new HttpRequest();
-                        searchReq.setEndpoint(searchEndpoint);
-                        searchReq.setMethod('GET');
-                        searchReq.setHeader('Accept', 'application/xml');
-                        Blob authBlob = Blob.valueOf(username + ':' + password);
-                        String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-                        searchReq.setHeader('Authorization', authHeader);
-                        searchReq.setTimeout(30000);
-                        
-                        Http http = new Http();
-                        HttpResponse searchRes = http.send(searchReq);
-                        
+                        HttpResponse searchRes = makeArloRequest(searchEndpoint, username, password);
+
                         if (searchRes.getStatusCode() == 200) {
-                            String responseBody = searchRes.getBody();
-                            // First try to find Resource element with type="Contact"
-                            Pattern resourcePattern = Pattern.compile('<Resource[^>]*type="[^"]*Contact[^"]*"[^>]*>');
-                            Matcher resourceMatcher = resourcePattern.matcher(responseBody);
-                            if (resourceMatcher.find()) {
-                                // Found Resource, now look for the self link after it
-                                Integer startPos = resourceMatcher.end();
-                                String remaining = responseBody.substring(startPos);
-                                Pattern linkPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                                Matcher linkMatcher = linkPattern.matcher(remaining);
-                                if (linkMatcher.find()) {
-                                    numericContactId = linkMatcher.group(1);
-                                }
-                            }
-                            
-                            // Fallback: look for any link to contacts
-                            if (String.isBlank(numericContactId)) {
-                                Pattern contactIdPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                                Matcher matcher = contactIdPattern.matcher(responseBody);
-                                if (matcher.find()) {
-                                    numericContactId = matcher.group(1);
-                                }
-                            }
+                            // Extract numeric contact ID from response using ArloXmlParser
+                            numericContactId = ArloXmlParser.extractFirstContactIdFromSearch(searchRes.getBody());
                         }
                     } catch (Exception e) {
-                        System.debug('ArloEventRegistrationSync: Error searching for contact by email: ' + e.getMessage());
+                        System.debug('ArloEventRegistrationSync: Error searching for contact by email ' + contact.Email + ': ' + e.getMessage());
+                        System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
                     }
                 }
                 
                 if (String.isBlank(numericContactId)) {
                     continue; // Can't find numeric ID, skip this contact
                 }
-                
-                // Debug: Check if this is contact 1944
-                if (numericContactId == '1944' || (contact.Arlo_Contact_UUID__c != null && contact.Arlo_Contact_UUID__c.contains('9b4c8fc8-eff0-4c04-a7b3-535fe95a23ff'))) {
-                    System.debug('ArloEventRegistrationSync: *** FALLBACK - FOUND CONTACT 1944 ***');
-                    System.debug('ArloEventRegistrationSync: Numeric ID: ' + numericContactId);
-                }
-                
+
                 // Get registrations directly from contact endpoint
                 calloutCount++;
                 String registrationsEndpoint = ARLO_API_BASE_URL + '/resources/contacts/' + numericContactId + '/registrations/';
-                HttpRequest regReq = new HttpRequest();
-                regReq.setEndpoint(registrationsEndpoint);
-                regReq.setMethod('GET');
-                regReq.setHeader('Accept', 'application/xml');
-                Blob authBlob = Blob.valueOf(username + ':' + password);
-                String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-                regReq.setHeader('Authorization', authHeader);
-                regReq.setTimeout(30000);
-                
-                Http http = new Http();
-                HttpResponse regRes = http.send(regReq);
-                
+                HttpResponse regRes = makeArloRequest(registrationsEndpoint, username, password);
+
                 if (regRes.getStatusCode() == 200) {
-                    String responseBody = regRes.getBody();
-                    
-                    // Parse registration IDs
-                    Set<String> registrationIds = new Set<String>();
-                    Pattern resourcePattern = Pattern.compile('<Resource[^>]*type="[^"]*Registration[^"]*"[^>]*>\\s*<Link[^>]*rel="self"[^>]*href="[^"]*/registrations/(\\d+)/"');
-                    Matcher resourceMatcher = resourcePattern.matcher(responseBody);
-                    while (resourceMatcher.find()) {
-                        registrationIds.add(resourceMatcher.group(1));
-                    }
-                    
-                    if (registrationIds.isEmpty()) {
-                        Pattern selfLinkPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/registrations/(\\d+)/"');
-                        Matcher selfMatcher = selfLinkPattern.matcher(responseBody);
-                        while (selfMatcher.find()) {
-                            registrationIds.add(selfMatcher.group(1));
-                        }
-                    }
-                    
+                    // Parse registration IDs using ArloXmlParser
+                    Set<String> registrationIds = ArloXmlParser.extractResourceIds(regRes.getBody(), 'registrations');
+
                     // Process each registration
                     for (String registrationId : registrationIds) {
                         if (calloutCount >= maxCallouts) {
@@ -3968,7 +3063,7 @@ public with sharing class ArloEventRegistrationSync {
                         
                         // Get contact details
                         calloutCount++;
-                        ArloContactSync.ArloContact arloContact = ArloContactSync.getSingleArloContactStatic(numericContactId, username, password);
+                        ArloModels.ArloContact arloContact = ArloContactSync.getSingleArloContactStatic(numericContactId, username, password);
                         if (arloContact == null) {
                             continue;
                         }
@@ -3991,22 +3086,16 @@ public with sharing class ArloEventRegistrationSync {
                                 wrapper.eventName = eventData.name;
                                 wrapper.eventCode = eventData.code;
                                 additionalWrappers.add(wrapper);
-                                
-                                // Debug: Check if this is contact 1944
-                                if (numericContactId == '1944') {
-                                    System.debug('ArloEventRegistrationSync: *** FALLBACK - ADDED CONTACT 1944 WRAPPER ***');
-                                    System.debug('ArloEventRegistrationSync: Event: ' + eventData.name);
-                                    System.debug('ArloEventRegistrationSync: Registration ID: ' + registrationId);
-                                }
                             }
                         }
                     }
                 }
             } catch (Exception e) {
                 System.debug('ArloEventRegistrationSync: Error processing contact ' + contact.Id + ' in fallback: ' + e.getMessage());
+                System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
             }
         }
-        
+
         // If we found additional contacts, process them
         if (!additionalWrappers.isEmpty()) {
             System.debug('ArloEventRegistrationSync: Fallback found ' + additionalWrappers.size() + ' additional contact-event pairs');
@@ -4044,213 +3133,62 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Get numeric contact ID by UUID
      */
+    @TestVisible
     private static String getNumericContactIdByUuidStatic(String uuid, String username, String password) {
         try {
             String searchEndpoint = ARLO_API_BASE_URL + '/resources/contacts/?UniqueIdentifier=' + EncodingUtil.urlEncode(uuid, 'UTF-8');
-            System.debug('ArloEventRegistrationSync: Searching for contact by UUID - Endpoint: ' + searchEndpoint);
-            
-            HttpRequest searchReq = new HttpRequest();
-            searchReq.setEndpoint(searchEndpoint);
-            searchReq.setMethod('GET');
-            searchReq.setHeader('Accept', 'application/xml');
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            searchReq.setHeader('Authorization', authHeader);
-            searchReq.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse searchRes = http.send(searchReq);
-            
-            System.debug('ArloEventRegistrationSync: UUID search response status: ' + searchRes.getStatusCode());
-            
+            HttpResponse searchRes = makeArloRequest(searchEndpoint, username, password);
+
             if (searchRes.getStatusCode() == 200) {
-                String responseBody = searchRes.getBody();
-                System.debug('ArloEventRegistrationSync: UUID search response body (first 500 chars): ' + (responseBody.length() > 500 ? responseBody.substring(0, 500) : responseBody));
-                
-                // Method 1: Look for Resource element with type="Contact" and its self link
-                Pattern resourcePattern = Pattern.compile('<Resource[^>]*type="[^"]*Contact[^"]*"[^>]*>');
-                Matcher resourceMatcher = resourcePattern.matcher(responseBody);
-                if (resourceMatcher.find()) {
-                    Integer startPos = resourceMatcher.end();
-                    String remaining = responseBody.substring(startPos);
-                    // Look for self link within next 1000 characters
-                    String searchArea = remaining.length() > 1000 ? remaining.substring(0, 1000) : remaining;
-                    Pattern linkPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                    Matcher linkMatcher = linkPattern.matcher(searchArea);
-                    if (linkMatcher.find()) {
-                        String numericId = linkMatcher.group(1);
-                        System.debug('ArloEventRegistrationSync: ✓ Found numeric ID by UUID (Method 1): ' + numericId);
-                        return numericId;
-                    }
-                }
-                
-                // Method 2: Look for any self link pointing to contacts (broader search)
-                Pattern contactIdPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                Matcher matcher = contactIdPattern.matcher(responseBody);
-                if (matcher.find()) {
-                    String numericId = matcher.group(1);
-                    System.debug('ArloEventRegistrationSync: ✓ Found numeric ID by UUID (Method 2 - fallback): ' + numericId);
-                    return numericId;
-                }
-                
-                // Method 3: Look for any link with href containing /contacts/ followed by digits
-                Pattern broadPattern = Pattern.compile('href="[^"]*/contacts/(\\d+)/"');
-                Matcher broadMatcher = broadPattern.matcher(responseBody);
-                if (broadMatcher.find()) {
-                    String numericId = broadMatcher.group(1);
-                    System.debug('ArloEventRegistrationSync: ✓ Found numeric ID by UUID (Method 3 - broad fallback): ' + numericId);
-                    return numericId;
-                }
-                
-                System.debug('ArloEventRegistrationSync: ✗ Could not parse numeric contact ID from UUID search response');
-                System.debug('ArloEventRegistrationSync: Full response length: ' + responseBody.length());
-            } else {
-                System.debug('ArloEventRegistrationSync: ✗ UUID search failed with status: ' + searchRes.getStatusCode());
-                System.debug('ArloEventRegistrationSync: Response body: ' + searchRes.getBody());
+                // Use ArloXmlParser to extract contact ID from search response
+                return ArloXmlParser.extractFirstContactIdFromSearch(searchRes.getBody());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting numeric contact ID by UUID: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting numeric contact ID by UUID ' + uuid + ': ' + e.getMessage());
             System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return null;
     }
-    
+
     /**
      * Get numeric contact ID by Email
      */
+    @TestVisible
     private static String getNumericContactIdByEmailStatic(String email, String username, String password) {
         try {
             String searchEndpoint = ARLO_API_BASE_URL + '/resources/contacts/?Email=' + EncodingUtil.urlEncode(email, 'UTF-8');
-            HttpRequest searchReq = new HttpRequest();
-            searchReq.setEndpoint(searchEndpoint);
-            searchReq.setMethod('GET');
-            searchReq.setHeader('Accept', 'application/xml');
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            searchReq.setHeader('Authorization', authHeader);
-            searchReq.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse searchRes = http.send(searchReq);
-            
+            HttpResponse searchRes = makeArloRequest(searchEndpoint, username, password);
+
             if (searchRes.getStatusCode() == 200) {
-                String responseBody = searchRes.getBody();
-                Pattern resourcePattern = Pattern.compile('<Resource[^>]*type="[^"]*Contact[^"]*"[^>]*>');
-                Matcher resourceMatcher = resourcePattern.matcher(responseBody);
-                if (resourceMatcher.find()) {
-                    Integer startPos = resourceMatcher.end();
-                    String remaining = responseBody.substring(startPos);
-                    Pattern linkPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                    Matcher linkMatcher = linkPattern.matcher(remaining);
-                    if (linkMatcher.find()) {
-                        return linkMatcher.group(1);
-                    }
-                }
-                
-                // Fallback: look for any link to contacts
-                Pattern contactIdPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/contacts/(\\d+)/"');
-                Matcher matcher = contactIdPattern.matcher(responseBody);
-                if (matcher.find()) {
-                    return matcher.group(1);
-                }
+                // Use ArloXmlParser to extract contact ID from search response
+                return ArloXmlParser.extractFirstContactIdFromSearch(searchRes.getBody());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting numeric contact ID by email: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting numeric contact ID by email ' + email + ': ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
         }
         return null;
     }
-    
+
     /**
      * Get all registrations for a contact
+     * Public static for reuse by ArloRegistrationSyncBatch
      */
-    private static Set<String> getContactRegistrationsStatic(String numericContactId, String username, String password) {
+    public static Set<String> getContactRegistrationsStatic(String numericContactId, String username, String password) {
         Set<String> registrationIds = new Set<String>();
         try {
             String registrationsEndpoint = ARLO_API_BASE_URL + '/resources/contacts/' + numericContactId + '/registrations/';
-            System.debug('ArloEventRegistrationSync: Getting registrations from: ' + registrationsEndpoint);
-            
-            HttpRequest regReq = new HttpRequest();
-            regReq.setEndpoint(registrationsEndpoint);
-            regReq.setMethod('GET');
-            regReq.setHeader('Accept', 'application/xml');
-            Blob authBlob = Blob.valueOf(username + ':' + password);
-            String authHeader = 'Basic ' + EncodingUtil.base64Encode(authBlob);
-            regReq.setHeader('Authorization', authHeader);
-            regReq.setTimeout(30000);
-            
-            Http http = new Http();
-            HttpResponse regRes = http.send(regReq);
-            
+            HttpResponse regRes = makeArloRequest(registrationsEndpoint, username, password);
+
             if (regRes.getStatusCode() == 200) {
-                String responseBody = regRes.getBody();
-                
-                // Debug: Log response for contact 1944
-                if (numericContactId == '1944') {
-                    System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Registrations response (first 2000 chars): ' + responseBody.substring(0, Math.min(responseBody.length(), 2000)));
-                }
-                
-                // Parse registration IDs - Method 1: Resource elements with type="Registration"
-                // Look for Resource with type containing "Registration", then find Link with rel="self" pointing to registrations
-                // Use a simpler pattern that works without DOTALL
-                Pattern resourcePattern = Pattern.compile('<Resource[^>]*type="[^"]*Registration[^"]*"[^>]*>');
-                Matcher resourceMatcher = resourcePattern.matcher(responseBody);
-                Integer lastResourceEnd = 0;
-                while (resourceMatcher.find()) {
-                    Integer resourceStart = resourceMatcher.start();
-                    // Look for the self link after this Resource tag (within next 500 chars to avoid matching wrong links)
-                    Integer searchEnd = Math.min(resourceStart + 500, responseBody.length());
-                    String resourceSection = responseBody.substring(resourceStart, searchEnd);
-                    Pattern linkPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/registrations/(\\d+)/"');
-                    Matcher linkMatcher = linkPattern.matcher(resourceSection);
-                    if (linkMatcher.find()) {
-                        String regId = linkMatcher.group(1);
-                        registrationIds.add(regId);
-                        System.debug('ArloEventRegistrationSync: Found registration ID (Method 1 - Resource): ' + regId);
-                    }
-                }
-                
-                // Method 2: Self links if no resources found
-                if (registrationIds.isEmpty()) {
-                    Pattern selfLinkPattern = Pattern.compile('<Link[^>]*rel="self"[^>]*href="[^"]*/registrations/(\\d+)/"');
-                    Matcher selfMatcher = selfLinkPattern.matcher(responseBody);
-                    while (selfMatcher.find()) {
-                        String regId = selfMatcher.group(1);
-                        registrationIds.add(regId);
-                        System.debug('ArloEventRegistrationSync: Found registration ID (Method 2 - Self link): ' + regId);
-                    }
-                }
-                
-                // Method 3: Fallback - look for any registration link (same as diagnoseContactCampaigns)
-                if (registrationIds.isEmpty()) {
-                    Pattern fallbackPattern = Pattern.compile('<Link[^>]*href="[^"]*/registrations/(\\d+)/"');
-                    Matcher fallbackMatcher = fallbackPattern.matcher(responseBody);
-                    Set<String> allMatches = new Set<String>();
-                    while (fallbackMatcher.find()) {
-                        allMatches.add(fallbackMatcher.group(1));
-                    }
-                    if (!allMatches.isEmpty()) {
-                        System.debug('ArloEventRegistrationSync: Found ' + allMatches.size() + ' registration ID(s) using fallback pattern: ' + String.join(new List<String>(allMatches), ', '));
-                        registrationIds = allMatches;
-                    }
-                }
-                
-                System.debug('ArloEventRegistrationSync: Total unique registration IDs found for contact ' + numericContactId + ': ' + registrationIds.size());
-                if (numericContactId == '1944') {
-                    System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Found ' + registrationIds.size() + ' registration(s): ' + String.join(new List<String>(registrationIds), ', '));
-                }
+                // Use ArloXmlParser to extract registration IDs
+                registrationIds = ArloXmlParser.extractResourceIds(regRes.getBody(), 'registrations');
             } else {
-                System.debug('ArloEventRegistrationSync: Error getting registrations. Status: ' + regRes.getStatusCode());
-                if (numericContactId == '1944') {
-                    System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Registrations endpoint returned status: ' + regRes.getStatusCode());
-                    System.debug('ArloEventRegistrationSync: Response body: ' + regRes.getBody());
-                }
+                System.debug('ArloEventRegistrationSync: Error getting registrations for contact ' + numericContactId + '. Status: ' + regRes.getStatusCode());
             }
         } catch (Exception e) {
-            System.debug('ArloEventRegistrationSync: Error getting contact registrations: ' + e.getMessage());
+            System.debug('ArloEventRegistrationSync: Error getting contact registrations for contact ' + numericContactId + ': ' + e.getMessage());
             System.debug('ArloEventRegistrationSync: Stack trace: ' + e.getStackTraceString());
-            if (numericContactId == '1944') {
-                System.debug('ArloEventRegistrationSync: *** CONTACT 1944 - Exception getting registrations: ' + e.getMessage());
-            }
         }
         return registrationIds;
     }
@@ -4258,135 +3196,19 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Deep diagnostic for a specific contact - checks matching logic
      * Usage: ArloEventRegistrationSync.deepDiagnoseContact('kavanagha@hautapu.school.nz');
+     * Delegates to SyncDiagnostics
      */
     public static void deepDiagnoseContact(String emailOrUuid) {
-        System.debug('=== DEEP DIAGNOSTIC ===');
-        System.debug('Checking: ' + emailOrUuid);
-        
-        // Find contact in Salesforce
-        List<Contact> contacts = [
-            SELECT Id, FirstName, LastName, Email, Arlo_Contact_UUID__c, AccountId, Account.Name
-            FROM Contact
-            WHERE Email = :emailOrUuid OR Arlo_Contact_UUID__c = :emailOrUuid
-            LIMIT 1
-        ];
-        
-        if (contacts.isEmpty()) {
-            System.debug('❌ Contact not found in Salesforce');
-            return;
-        }
-        
-        Contact c = contacts[0];
-        System.debug('✓ Contact found in Salesforce:');
-        System.debug('  ID: ' + c.Id);
-        System.debug('  Name: ' + c.FirstName + ' ' + c.LastName);
-        System.debug('  Email: "' + c.Email + '" (length: ' + (c.Email != null ? c.Email.length() : 0) + ')');
-        System.debug('  UUID: "' + c.Arlo_Contact_UUID__c + '" (length: ' + (c.Arlo_Contact_UUID__c != null ? c.Arlo_Contact_UUID__c.length() : 0) + ')');
-        System.debug('  Account: ' + (c.Account != null ? c.Account.Name : 'None'));
-        
-        // Normalize values for matching
-        String normalizedEmail = c.Email != null ? c.Email.toLowerCase().trim() : '';
-        String normalizedUuid = c.Arlo_Contact_UUID__c != null ? c.Arlo_Contact_UUID__c.trim() : '';
-        
-        System.debug('\nNormalized values for matching:');
-        System.debug('  Email (normalized): "' + normalizedEmail + '"');
-        System.debug('  UUID (normalized): "' + normalizedUuid + '"');
-        
-        // Check campaign memberships
-        List<CampaignMember> members = [
-            SELECT Campaign.Name, Status, CampaignId
-            FROM CampaignMember
-            WHERE ContactId = :c.Id AND Campaign.Name LIKE 'NHM - %'
-        ];
-        
-        System.debug('\nCurrent Campaign Memberships: ' + members.size());
-        for (CampaignMember cm : members) {
-            System.debug('  - ' + cm.Campaign.Name + ' (Status: ' + cm.Status + ', Campaign ID: ' + cm.CampaignId + ')');
-        }
-        
-        // Check if campaigns exist
-        List<Campaign> campaigns = [
-            SELECT Id, Name
-            FROM Campaign
-            WHERE Name IN ('NHM - Anxiety', 'NHM - Digital wellbeing', 'NHM - Self-care', 'NHM - Neurodiversity')
-        ];
-        
-        System.debug('\nAvailable Campaigns: ' + campaigns.size());
-        for (Campaign camp : campaigns) {
-            System.debug('  - ' + camp.Name + ' (ID: ' + camp.Id + ')');
-        }
-        
-        System.debug('\n=== MATCHING ANALYSIS ===');
-        System.debug('When Event Registration Sync runs, it will:');
-        System.debug('1. Get contact from Arlo (UUID: 9b4c8fc8-eff0-4c04-a7b3-535fe95a23ff)');
-        System.debug('2. Try to match to Salesforce contact by:');
-        System.debug('   a) UUID: Comparing "' + normalizedUuid + '" with "9b4c8fc8-eff0-4c04-a7b3-535fe95a23ff"');
-        System.debug('      Match: ' + (normalizedUuid == '9b4c8fc8-eff0-4c04-a7b3-535fe95a23ff'));
-        System.debug('   b) Email: Comparing "' + normalizedEmail + '" with "kavanagha@hautapu.school.nz"');
-        System.debug('      Match: ' + (normalizedEmail == 'kavanagha@hautapu.school.nz'));
-        
-        if (members.isEmpty()) {
-            System.debug('\n⚠️  Contact is NOT in any NHM campaigns');
-            System.debug('This means the Event Registration Sync either:');
-            System.debug('  1. Hasn\'t processed this contact\'s registration yet');
-            System.debug('  2. Failed to match the contact (UUID/Email mismatch)');
-            System.debug('  3. Event name didn\'t match keywords');
-            System.debug('  4. Registration email consent was false');
-        }
-        
-        System.debug('=== END DEEP DIAGNOSTIC ===\n');
+        SyncDiagnostics.deepDiagnoseContact(emailOrUuid);
     }
-    
+
     /**
      * Quick check method for a specific contact by email or UUID
      * Usage: ArloEventRegistrationSync.quickCheckContact('kavanagha@hautapu.school.nz');
+     * Delegates to SyncDiagnostics
      */
     public static void quickCheckContact(String emailOrUuid) {
-        System.debug('=== QUICK CHECK ===');
-        System.debug('Checking: ' + emailOrUuid);
-        
-        // Find contact
-        List<Contact> contacts = [
-            SELECT Id, FirstName, LastName, Email, Arlo_Contact_UUID__c, AccountId, Account.Name
-            FROM Contact
-            WHERE Email = :emailOrUuid OR Arlo_Contact_UUID__c = :emailOrUuid
-            LIMIT 1
-        ];
-        
-        if (contacts.isEmpty()) {
-            System.debug('❌ Contact not found');
-            return;
-        }
-        
-        Contact c = contacts[0];
-        System.debug('✓ Contact: ' + c.FirstName + ' ' + c.LastName);
-        System.debug('  ID: ' + c.Id);
-        System.debug('  Email: ' + c.Email);
-        System.debug('  UUID: ' + c.Arlo_Contact_UUID__c);
-        System.debug('  Account: ' + (c.Account != null ? c.Account.Name : 'None'));
-        
-        // Check campaign memberships
-        List<CampaignMember> members = [
-            SELECT Campaign.Name, Status
-            FROM CampaignMember
-            WHERE ContactId = :c.Id AND Campaign.Name LIKE 'NHM - %'
-        ];
-        
-        System.debug('\nCampaign Memberships: ' + members.size());
-        for (CampaignMember cm : members) {
-            System.debug('  - ' + cm.Campaign.Name + ' (' + cm.Status + ')');
-        }
-        
-        if (members.isEmpty()) {
-            System.debug('\n⚠️  Not in any NHM campaigns');
-            System.debug('Possible reasons:');
-            System.debug('  1. Event Registration Sync hasn\'t run yet');
-            System.debug('  2. Contact was synced via Contact Sync (not Event Registration Sync)');
-            System.debug('  3. Event name doesn\'t match keywords (Anxiety, Digital wellbeing, Self-care, Neurodiversity)');
-            System.debug('  4. Registration email consent check failed');
-        }
-        
-        System.debug('=== END QUICK CHECK ===\n');
+        SyncDiagnostics.quickCheckContact(emailOrUuid);
     }
     
     /**
@@ -4446,7 +3268,7 @@ public with sharing class ArloEventRegistrationSync {
         System.debug('✓ Contact is Active');
         
         System.debug('\n=== STEP 2: Check Contact Details (UUID/Email) ===');
-        ArloContactSync.ArloContact arloContact = getContactUuidAndEmailOnly(arloNumericContactId, arloUsername, arloPassword);
+        ArloModels.ArloContact arloContact = getContactUuidAndEmailOnly(arloNumericContactId, arloUsername, arloPassword);
         if (arloContact == null) {
             System.debug('❌ Could not retrieve contact details from Arlo');
             return;
@@ -4548,7 +3370,7 @@ public with sharing class ArloEventRegistrationSync {
         System.debug('✓ Contact has ' + registrationsWithConsent + ' registration(s) with consent');
         
         System.debug('\n=== STEP 5: Check Employment/Organization Data ===');
-        ArloContactSync.ArloContact fullContact = ArloContactSync.getSingleArloContactStatic(arloNumericContactId, arloUsername, arloPassword);
+        ArloModels.ArloContact fullContact = ArloContactSync.getSingleArloContactStatic(arloNumericContactId, arloUsername, arloPassword);
         if (fullContact == null) {
             System.debug('❌ Could not retrieve full contact details (including employment)');
             return;
@@ -4597,20 +3419,13 @@ public with sharing class ArloEventRegistrationSync {
     /**
      * Trace a specific contact through the full sync process
      * This will add debug logging for a specific contact ID throughout the sync
-     * 
+     *
      * Usage: ArloEventRegistrationSync.traceContactInSync('2192');
      * Then run the full sync and check logs for messages containing this contact ID
+     * Delegates to SyncDiagnostics
      */
     public static void traceContactInSync(String numericContactId) {
-        System.debug('=== TRACING CONTACT IN SYNC ===');
-        System.debug('Contact Numeric ID: ' + numericContactId);
-        System.debug('This contact will be traced through the full sync process');
-        System.debug('Look for debug messages containing: "*** CONTACT ' + numericContactId + '"');
-        System.debug('=== END TRACE SETUP ===\n');
-        
-        // Store the contact ID to trace (we'll check this in the sync process)
-        // Note: This is a simple approach - in production you might want to use a Custom Setting
-        System.debug('ArloEventRegistrationSync: *** TRACE MODE ENABLED FOR CONTACT ' + numericContactId + ' ***');
+        SyncDiagnostics.traceContactInSync(numericContactId);
     }
     
     /**
